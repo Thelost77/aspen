@@ -1,0 +1,22 @@
+# Build output
+/aspen
+/dist/
+
+# Local agent state
+/.tickets/
+
+# Local runtime files
+*.log
+*.db
+*.db-shm
+*.db-wal
+config.toml
+
+# Test and profiling output
+coverage.out
+*.prof
+
+# Editors and macOS
+.DS_Store
+.idea/
+.vscode/
