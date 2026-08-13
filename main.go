@@ -46,7 +46,12 @@ func run(args []string) error {
 		return nil
 	}
 
-	protocol, err := inlineimage.SelectProtocol(*graphics, inlineimage.DetectTerminal)
+	selectionSource := "explicit"
+	protocol, err := inlineimage.SelectProtocol(*graphics, func() inlineimage.Protocol {
+		detected, source := inlineimage.DetectTerminalWithSource()
+		selectionSource = source
+		return detected
+	})
 	if err != nil {
 		return err
 	}
@@ -65,8 +70,10 @@ func run(args []string) error {
 		return resolver, errors.Join(diagnostics...)
 	})
 	model.SetInlineImageProtocol(protocol)
-	logger.Info("inline image protocol selected", "protocol", protocol.String())
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	terminalOutput := inlineimage.NewTerminalOutput(os.Stdout)
+	model.SetInlineImageOutput(terminalOutput)
+	logger.Info("inline image protocol selected", "protocol", protocol.String(), "source", selectionSource)
+	program := tea.NewProgram(model, tea.WithOutput(terminalOutput), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	final, err := program.Run()
 	if finalModel, ok := final.(app.Model); ok {
 		if closeErr := finalModel.Close(); err == nil {

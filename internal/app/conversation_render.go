@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Thelost77/aspen/internal/inlineimage"
 	"github.com/Thelost77/aspen/internal/messages"
 	"github.com/Thelost77/aspen/internal/ui"
 	"github.com/charmbracelet/lipgloss"
@@ -12,11 +13,13 @@ import (
 type renderedConversation struct {
 	content    string
 	placements []inlinePlacement
+	imageRefs  []inlineImageRef
 }
 
 type renderedBlock struct {
 	content    string
 	placements []inlinePlacement
+	imageRefs  []inlineImageRef
 }
 
 func renderMessages(all []messages.Message, chat messages.Chat, width int, styles ui.Styles) string {
@@ -49,6 +52,7 @@ func renderMessagesInline(
 
 	var output strings.Builder
 	var placements []inlinePlacement
+	var imageRefs []inlineImageRef
 	lineOffset := 0
 	for i, block := range blocks {
 		if i > 0 {
@@ -59,10 +63,14 @@ func renderMessagesInline(
 			placement.startLine += lineOffset
 			placements = append(placements, placement)
 		}
+		for _, ref := range block.imageRefs {
+			ref.startLine += lineOffset
+			imageRefs = append(imageRefs, ref)
+		}
 		output.WriteString(block.content)
 		lineOffset += renderedLineCount(block.content)
 	}
-	return renderedConversation{content: output.String(), placements: placements}
+	return renderedConversation{content: output.String(), placements: placements, imageRefs: imageRefs}
 }
 
 func renderMessageInline(
@@ -77,59 +85,61 @@ func renderMessageInline(
 	bubbleOuterWidth = min(bubbleOuterWidth, max(1, width-2))
 	contentWidth := max(1, bubbleOuterWidth-4)
 
-	var textLines []string
-	if text := strings.TrimSpace(message.Text); text != "" {
-		textLines = append(textLines, strings.Split(ui.Wrap(text, contentWidth), "\n")...)
-	}
-	var readyImages []struct {
-		attachment messages.Attachment
-		state      *inlineImageState
-	}
-	for _, attachment := range message.Attachments {
-		if attachment.IsImage && imageLookup != nil {
-			imageState := imageLookup(message.ChatID, attachment)
-			switch {
-			case imageState == nil:
-				textLines = append(textLines, strings.Split(ui.Wrap("📎 "+attachmentLabel(attachment), contentWidth), "\n")...)
-			case imageState.loading:
-				textLines = append(textLines, strings.Split(ui.Wrap("◌ Loading "+attachment.Name+"…", contentWidth), "\n")...)
-			case imageState.err != nil:
-				textLines = append(textLines, strings.Split(ui.Wrap("Image unavailable · "+attachment.Name, contentWidth), "\n")...)
-			default:
-				readyImages = append(readyImages, struct {
-					attachment messages.Attachment
-					state      *inlineImageState
-				}{attachment: attachment, state: imageState})
-			}
-			continue
-		}
-		textLines = append(textLines, strings.Split(ui.Wrap("📎 "+attachmentLabel(attachment), contentWidth), "\n")...)
-	}
-
 	type pendingPlacement struct {
 		key       inlineImageKey
 		startLine int
-		width     int
 		height    int
 	}
-	contentLines := append([]string(nil), textLines...)
+	type pendingRef struct {
+		attachment messages.Attachment
+		startLine  int
+		height     int
+	}
+
+	var contentLines []string
+	if text := strings.TrimSpace(message.Text); text != "" {
+		contentLines = append(contentLines, strings.Split(ui.Wrap(text, contentWidth), "\n")...)
+	}
 	var pending []pendingPlacement
-	for _, ready := range readyImages {
+	var pendingRefs []pendingRef
+	for _, attachment := range message.Attachments {
+		if !attachment.IsImage || imageLookup == nil {
+			contentLines = append(contentLines, strings.Split(ui.Wrap("📎 "+attachmentLabel(attachment), contentWidth), "\n")...)
+			continue
+		}
+
+		imageState := imageLookup(message.ChatID, attachment)
+		if imageState == nil || imageState.loading || imageState.err != nil {
+			start := len(contentLines)
+			label := "Image · " + attachment.Name
+			if imageState != nil && imageState.err != nil {
+				label = "Image unavailable · " + attachment.Name
+			}
+			lines := strings.Split(ui.Wrap(label, contentWidth), "\n")
+			contentLines = append(contentLines, lines...)
+			pendingRefs = append(pendingRefs, pendingRef{attachment: attachment, startLine: start, height: len(lines)})
+			continue
+		}
+
 		if len(contentLines) > 0 {
 			contentLines = append(contentLines, "")
 		}
-		columns := ready.state.rendered.Columns
-		rows := max(1, ready.state.rendered.Rows)
+		columns := imageState.rendered.Columns
+		rows := max(1, imageState.rendered.Rows)
 		start := len(contentLines)
-		for range rows {
-			contentLines = append(contentLines, strings.Repeat(" ", columns))
+		for row := range rows {
+			line := strings.Repeat(" ", columns)
+			if imageState.rendered.Protocol == inlineimage.Kitty {
+				line = imageState.rendered.PlaceholderRow(row)
+			}
+			contentLines = append(contentLines, line)
 		}
 		pending = append(pending, pendingPlacement{
-			key:       imageKey(message.ChatID, ready.attachment),
+			key:       imageKey(message.ChatID, attachment),
 			startLine: start,
-			width:     columns,
 			height:    rows,
 		})
+		pendingRefs = append(pendingRefs, pendingRef{attachment: attachment, startLine: start, height: rows})
 	}
 	if len(contentLines) == 0 {
 		contentLines = []string{"[Unsupported message]"}
@@ -152,8 +162,15 @@ func renderMessageInline(
 			key:       placement.key,
 			startLine: placement.startLine + 1,
 			left:      bubbleLeft + 2,
-			width:     placement.width,
 			height:    placement.height,
+		})
+	}
+	imageRefs := make([]inlineImageRef, 0, len(pendingRefs))
+	for _, ref := range pendingRefs {
+		imageRefs = append(imageRefs, inlineImageRef{
+			attachment: ref.attachment,
+			startLine:  ref.startLine + 1,
+			height:     ref.height,
 		})
 	}
 	if timestamp := ui.MessageTime(message.SentAt); timestamp != "" {
@@ -178,8 +195,11 @@ func renderMessageInline(
 		for i := range placements {
 			placements[i].startLine++
 		}
+		for i := range imageRefs {
+			imageRefs[i].startLine++
+		}
 	}
-	return renderedBlock{content: strings.Join(lines, "\n"), placements: placements}
+	return renderedBlock{content: strings.Join(lines, "\n"), placements: placements, imageRefs: imageRefs}
 }
 
 func attachmentLabel(attachment messages.Attachment) string {

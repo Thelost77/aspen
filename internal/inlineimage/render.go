@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	ansikitty "github.com/charmbracelet/x/ansi/kitty"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
 )
@@ -28,22 +29,76 @@ const (
 )
 
 const (
-	maxSourceSize  = 50 * 1024 * 1024
-	maxPixels      = 40_000_000
-	maxPixelWidth  = 1600
-	maxPixelHeight = 1200
-	kittyChunkSize = 4096
+	maxSourceSize    = 50 * 1024 * 1024
+	maxPixels        = 40_000_000
+	maxPixelWidth    = 1600
+	maxPixelHeight   = 1200
+	kittyChunkSize   = 4096
+	kittyPlacementID = 1
 )
 
+type ErrorKind string
+
+const (
+	ErrorUnavailable    ErrorKind = "unavailable"
+	ErrorSourceLimit    ErrorKind = "source_limit"
+	ErrorDimensionLimit ErrorKind = "dimension_limit"
+	ErrorConversion     ErrorKind = "conversion"
+	ErrorDecode         ErrorKind = "decode"
+	ErrorEncode         ErrorKind = "encode"
+	ErrorTimeout        ErrorKind = "timeout"
+	ErrorCanceled       ErrorKind = "canceled"
+	ErrorRender         ErrorKind = "render"
+)
+
+type renderError struct {
+	kind    ErrorKind
+	message string
+	cause   error
+}
+
+func (e *renderError) Error() string {
+	if e.cause == nil {
+		return e.message
+	}
+	return fmt.Sprintf("%s: %v", e.message, e.cause)
+}
+
+func (e *renderError) Unwrap() error {
+	return e.cause
+}
+
+func newRenderError(kind ErrorKind, message string, cause ...error) error {
+	var err error
+	if len(cause) > 0 {
+		err = cause[0]
+	}
+	return &renderError{kind: kind, message: message, cause: err}
+}
+
+func ErrorKindOf(err error) ErrorKind {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, context.DeadlineExceeded):
+		return ErrorTimeout
+	case errors.Is(err, context.Canceled):
+		return ErrorCanceled
+	}
+	var typed *renderError
+	if errors.As(err, &typed) {
+		return typed.kind
+	}
+	return ErrorRender
+}
+
 type Rendered struct {
-	Protocol    Protocol
-	ID          uint32
-	Columns     int
-	Rows        int
-	PixelWidth  int
-	PixelHeight int
-	transfer    string
-	display     string
+	Protocol Protocol
+	ID       uint32
+	Columns  int
+	Rows     int
+	transfer string
+	display  string
 }
 
 func Detect(getenv func(string) string) Protocol {
@@ -59,11 +114,14 @@ func Detect(getenv func(string) string) Protocol {
 }
 
 func Render(ctx context.Context, path string, protocol Protocol, id uint32, maxColumns, maxRows int) (Rendered, error) {
+	if err := ctx.Err(); err != nil {
+		return Rendered{}, err
+	}
 	if protocol == Unsupported {
-		return Rendered{}, errors.New("terminal does not support inline images")
+		return Rendered{}, newRenderError(ErrorRender, "terminal does not support inline images")
 	}
 	if maxColumns <= 0 || maxRows <= 0 {
-		return Rendered{}, errors.New("image has no available terminal space")
+		return Rendered{}, newRenderError(ErrorDimensionLimit, "image has no available terminal space")
 	}
 	actualPath, cleanup, err := prepareImage(ctx, path)
 	if err != nil {
@@ -75,108 +133,112 @@ func Render(ctx context.Context, path string, protocol Protocol, id uint32, maxC
 
 	file, err := os.Open(actualPath)
 	if err != nil {
-		return Rendered{}, errors.New("cannot open image attachment")
+		return Rendered{}, newRenderError(ErrorUnavailable, "cannot open image attachment")
 	}
 	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil {
-		return Rendered{}, errors.New("cannot inspect image attachment")
+		return Rendered{}, newRenderError(ErrorUnavailable, "cannot inspect image attachment")
 	}
 	if !info.Mode().IsRegular() || info.Size() > maxSourceSize {
-		return Rendered{}, errors.New("image attachment is not a regular file under 50 MB")
+		return Rendered{}, newRenderError(ErrorSourceLimit, "image attachment is not a regular file under 50 MB")
 	}
 	configuration, _, err := image.DecodeConfig(file)
 	if err != nil {
-		return Rendered{}, fmt.Errorf("read image dimensions: %w", err)
+		return Rendered{}, newRenderError(ErrorDecode, "read image dimensions", err)
 	}
 	if configuration.Width <= 0 || configuration.Height <= 0 || int64(configuration.Width)*int64(configuration.Height) > maxPixels {
-		return Rendered{}, errors.New("image dimensions exceed the safe inline limit")
+		return Rendered{}, newRenderError(ErrorDimensionLimit, "image dimensions exceed the safe inline limit")
 	}
 	if _, err := file.Seek(0, 0); err != nil {
-		return Rendered{}, errors.New("cannot rewind image attachment")
+		return Rendered{}, newRenderError(ErrorDecode, "cannot rewind image attachment")
 	}
 	source, _, err := image.Decode(file)
 	if err != nil {
-		return Rendered{}, fmt.Errorf("decode image attachment: %w", err)
+		return Rendered{}, newRenderError(ErrorDecode, "decode image attachment", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Rendered{}, err
 	}
 
 	columns, rows := fitCells(configuration.Width, configuration.Height, protocol, maxColumns, maxRows)
 	encodedImage := resizeForTransfer(source)
+	if err := ctx.Err(); err != nil {
+		return Rendered{}, err
+	}
 	var encoded bytes.Buffer
 	if err := png.Encode(&encoded, encodedImage); err != nil {
-		return Rendered{}, fmt.Errorf("encode inline PNG: %w", err)
+		return Rendered{}, newRenderError(ErrorEncode, "encode inline PNG", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Rendered{}, err
 	}
 	payload := encoded.Bytes()
 	result := Rendered{
-		Protocol:    protocol,
-		ID:          id,
-		Columns:     columns,
-		Rows:        rows,
-		PixelWidth:  encodedImage.Bounds().Dx(),
-		PixelHeight: encodedImage.Bounds().Dy(),
+		Protocol: protocol,
+		ID:       id,
+		Columns:  columns,
+		Rows:     rows,
 	}
 	switch protocol {
 	case Kitty:
-		result.transfer = kittyTransfer(id, encodedImage.Bounds().Dx(), encodedImage.Bounds().Dy(), payload)
+		result.transfer = wrapTmux(kittyTransfer(id, columns, rows, payload))
 	case ITerm2:
 		encodedPayload := base64.StdEncoding.EncodeToString(payload)
-		result.display = fmt.Sprintf("\x1b]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=1;size=%d:%s\x07", columns, rows, len(payload), encodedPayload)
+		result.display = wrapTmux(fmt.Sprintf("\x1b]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=1;size=%d:%s\x07", columns, rows, len(payload), encodedPayload))
 	}
 	return result, nil
 }
 
+func (r Rendered) PayloadBytes() int {
+	return len(r.transfer) + len(r.display)
+}
+
 func (r Rendered) TransferSequence() string {
-	return wrapTmux(r.transfer)
+	return r.transfer
 }
 
-func (r Rendered) DisplaySequence(placementID uint32) string {
-	return r.DisplayRegionSequence(placementID, 0, r.Rows)
+func (r Rendered) ITerm2DisplaySequence() string {
+	if r.Protocol != ITerm2 {
+		return ""
+	}
+	return r.display
 }
 
-func (r Rendered) DisplayRegionSequence(placementID uint32, clippedTopRows, visibleRows int) string {
-	if visibleRows <= 0 || clippedTopRows < 0 || clippedTopRows+visibleRows > r.Rows {
+func (r Rendered) ITerm2DisplayRegionSequence(clippedTopRows, visibleRows int) string {
+	if clippedTopRows != 0 || visibleRows != r.Rows {
 		return ""
 	}
-	switch r.Protocol {
-	case Kitty:
-		if r.PixelWidth <= 0 || r.PixelHeight <= 0 || r.Rows <= 0 {
-			if clippedTopRows != 0 || visibleRows != r.Rows {
-				return ""
-			}
-			return wrapTmux(fmt.Sprintf("\x1b_Ga=p,i=%d,p=%d,c=%d,r=%d,C=1,z=1,q=2\x1b\\", r.ID, placementID, r.Columns, r.Rows))
-		}
-		sourceY := r.PixelHeight * clippedTopRows / r.Rows
-		sourceEnd := r.PixelHeight * (clippedTopRows + visibleRows) / r.Rows
-		sourceHeight := max(1, sourceEnd-sourceY)
-		return wrapTmux(fmt.Sprintf(
-			"\x1b_Ga=p,i=%d,p=%d,x=0,y=%d,w=%d,h=%d,c=%d,r=%d,C=1,z=1,q=2\x1b\\",
-			r.ID, placementID, sourceY, r.PixelWidth, sourceHeight, r.Columns, visibleRows,
-		))
-	case ITerm2:
-		if clippedTopRows == 0 && visibleRows == r.Rows {
-			return wrapTmux(r.display)
-		}
-		return ""
-	default:
-		return ""
-	}
+	return r.ITerm2DisplaySequence()
 }
 
-func (r Rendered) DeletePlacementSequence(placementID uint32) string {
-	if r.Protocol != Kitty {
+func (r Rendered) PlaceholderRow(row int) string {
+	if r.Protocol != Kitty || row < 0 || row >= r.Rows || r.Columns <= 0 {
 		return ""
 	}
-	return wrapTmux(fmt.Sprintf("\x1b_Ga=d,d=i,i=%d,p=%d,q=2\x1b\\", r.ID, placementID))
+	red := (r.ID >> 16) & 0xff
+	green := (r.ID >> 8) & 0xff
+	blue := r.ID & 0xff
+	var output strings.Builder
+	_, _ = fmt.Fprintf(&output, "\x1b[38;2;%d;%d;%dm\x1b[58;5;%dm", red, green, blue, kittyPlacementID)
+	for column := range r.Columns {
+		output.WriteRune(ansikitty.Placeholder)
+		output.WriteRune(ansikitty.Diacritic(row))
+		output.WriteRune(ansikitty.Diacritic(column))
+		output.WriteRune(ansikitty.Diacritic(int(r.ID >> 24)))
+	}
+	output.WriteString("\x1b[39m\x1b[59m")
+	return output.String()
 }
 
 func (r Rendered) DeleteImageSequence() string {
 	if r.Protocol != Kitty {
 		return ""
 	}
-	return wrapTmux(fmt.Sprintf("\x1b_Ga=d,d=i,i=%d,q=2\x1b\\", r.ID))
+	return wrapTmux(fmt.Sprintf("\x1b_Ga=d,d=I,i=%d,q=2\x1b\\", r.ID))
 }
 
-func kittyTransfer(id uint32, width, height int, payload []byte) string {
+func kittyTransfer(id uint32, columns, rows int, payload []byte) string {
 	encoded := base64.StdEncoding.EncodeToString(payload)
 	var output strings.Builder
 	first := true
@@ -189,7 +251,11 @@ func kittyTransfer(id uint32, width, height int, payload []byte) string {
 			more = 1
 		}
 		if first {
-			_, _ = fmt.Fprintf(&output, "\x1b_Ga=t,f=100,t=d,i=%d,s=%d,v=%d,q=2,m=%d;%s\x1b\\", id, width, height, more, chunk)
+			_, _ = fmt.Fprintf(
+				&output,
+				"\x1b_Ga=T,f=100,t=d,i=%d,p=%d,c=%d,r=%d,U=1,C=1,N=1,q=2,m=%d;%s\x1b\\",
+				id, kittyPlacementID, columns, rows, more, chunk,
+			)
 			first = false
 		} else {
 			_, _ = fmt.Fprintf(&output, "\x1b_Gm=%d,q=2;%s\x1b\\", more, chunk)
@@ -225,12 +291,15 @@ func resizeForTransfer(source image.Image) image.Image {
 }
 
 func prepareImage(ctx context.Context, path string) (string, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return "", nil, err
+	}
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return "", nil, errors.New("image attachment file is unavailable")
+		return "", nil, newRenderError(ErrorUnavailable, "image attachment file is unavailable")
 	}
 	if info.Size() > maxSourceSize {
-		return "", nil, errors.New("image attachment exceeds the 50 MB inline limit")
+		return "", nil, newRenderError(ErrorSourceLimit, "image attachment exceeds the 50 MB inline limit")
 	}
 	extension := strings.ToLower(filepath.Ext(path))
 	if extension != ".heic" && extension != ".heif" {
@@ -238,23 +307,26 @@ func prepareImage(ctx context.Context, path string) (string, func(), error) {
 	}
 	temporary, err := os.CreateTemp("", "aspen-inline-*.png")
 	if err != nil {
-		return "", nil, fmt.Errorf("create secure inline image file: %w", err)
+		return "", nil, newRenderError(ErrorConversion, "create secure inline image file", err)
 	}
 	temporaryPath := temporary.Name()
 	if err := temporary.Chmod(0o600); err != nil {
 		_ = temporary.Close()
 		_ = os.Remove(temporaryPath)
-		return "", nil, fmt.Errorf("secure inline image file: %w", err)
+		return "", nil, newRenderError(ErrorConversion, "secure inline image file", err)
 	}
 	if err := temporary.Close(); err != nil {
 		_ = os.Remove(temporaryPath)
-		return "", nil, fmt.Errorf("close inline image file: %w", err)
+		return "", nil, newRenderError(ErrorConversion, "close inline image file", err)
 	}
 	cleanup := func() { _ = os.Remove(temporaryPath) }
 	command := exec.CommandContext(ctx, "/usr/bin/sips", "-s", "format", "png", path, "--out", temporaryPath)
 	if err := command.Run(); err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("convert HEIC image with sips: %w", err)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return "", nil, contextErr
+		}
+		return "", nil, newRenderError(ErrorConversion, "convert HEIC image with sips", err)
 	}
 	return temporaryPath, cleanup, nil
 }

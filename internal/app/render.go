@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Thelost77/aspen/internal/inlineimage"
 	"github.com/Thelost77/aspen/internal/messages"
 	msgsender "github.com/Thelost77/aspen/internal/sender"
 	"github.com/Thelost77/aspen/internal/ui"
@@ -23,7 +24,7 @@ func (m Model) View() string {
 	base := ui.Canvas(lipgloss.JoinVertical(lipgloss.Left, body, footer), width, m.height)
 	if m.help.Visible() {
 		help := ui.Canvas(m.help.View(), width, m.height)
-		return m.viewWithoutInlinePlacements(help)
+		return help
 	}
 	return base
 }
@@ -86,7 +87,7 @@ func (m Model) viewConversation() string {
 			details += "loading older…"
 		}
 	}
-	titleLine := ui.PadRight(title, width) + m.inlineTransfers(chat.ID)
+	titleLine := ui.PadRight(title, width) + m.inlineImageFrameMarker()
 	detailLine := ui.PadRight(m.styles.Muted.Render(ui.Truncate(details, width)), width)
 	if searchLine, ok := m.conversationSearchHeader(chat.ID, width); ok {
 		detailLine = searchLine
@@ -104,10 +105,9 @@ func (m Model) viewConversation() string {
 	case m.conversationFilterActive(chat.ID) && len(m.search.matches) == 0:
 		query := strings.TrimSpace(m.search.input.Value())
 		empty := ui.Truncate(fmt.Sprintf("No loaded messages match %q", query), width)
-		emptyView := lipgloss.Place(width, m.viewport.Height, lipgloss.Center, lipgloss.Center, m.styles.Muted.Render(empty))
-		content = m.decorateInlineImages(emptyView, state)
+		content = lipgloss.Place(width, m.viewport.Height, lipgloss.Center, lipgloss.Center, m.styles.Muted.Render(empty))
 	default:
-		content = m.decorateInlineImages(m.viewport.View(), state)
+		content = m.viewport.View()
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, header, content, m.viewComposer(chat, width))
 }
@@ -177,7 +177,11 @@ func (m Model) viewFooter(width int) string {
 		}
 	}
 	if m.focus != FocusComposer && !m.search.editing {
-		parts = append(parts, key("i", "write"), key("tab", "focus"), key("r", "refresh"), key("?", "help"), key("q", "quit"))
+		parts = append(parts, key("i", "write"), key("tab", "focus"), key("r", "refresh"))
+		if m.imageProtocol != inlineimage.Unsupported {
+			parts = append(parts, key("R", "retry images"))
+		}
+		parts = append(parts, key("?", "help"), key("q", "quit"))
 	}
 	footer := strings.Join(parts, sep)
 	if status := m.footerStatus(); status != "" {

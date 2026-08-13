@@ -60,14 +60,14 @@ func (m Model) handleConversationSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) 
 			m.syncViewport(false)
 			m.viewport.SetYOffset(m.search.editOffset)
 			m.saveViewportOffset()
-			return m, nil
+			return m, m.refreshInlineImages()
 		}
 		m.clearConversationSearch(true)
-		return m, nil
+		return m, m.refreshInlineImages()
 	case "enter":
 		if strings.TrimSpace(m.search.input.Value()) == "" {
 			m.clearConversationSearch(true)
-			return m, nil
+			return m, m.refreshInlineImages()
 		}
 		m.search.beforeEdit = ""
 		m.search.editing = false
@@ -76,14 +76,14 @@ func (m Model) handleConversationSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) 
 		m.syncViewport(false)
 		m.viewport.GotoTop()
 		m.saveViewportOffset()
-		return m, nil
+		return m, m.refreshInlineImages()
 	default:
 		var cmd tea.Cmd
 		m.search.input, cmd = m.search.input.Update(msg)
 		m.recomputeConversationSearch()
 		m.syncViewport(false)
 		m.viewport.GotoTop()
-		return m, cmd
+		return m, tea.Batch(cmd, m.refreshInlineImages())
 	}
 }
 

@@ -43,6 +43,9 @@ func TestInlineImageIsInsideSingleMessageOutline(t *testing.T) {
 		t.Fatalf("placements = %d, want 1", len(block.placements))
 	}
 	placement := block.placements[0]
+	if !strings.Contains(ansi.Strip(block.content), "\U0010eeee") {
+		t.Fatalf("message bubble lacks Kitty placeholders:\n%s", ansi.Strip(block.content))
+	}
 	if placement.startLine != 1 || !strings.Contains(plain[0], "╭") || !strings.Contains(plain[placement.startLine+placement.height], "╰") {
 		t.Fatalf("image is not enclosed by one rounded outline: placement=%#v\n%s", placement, ansi.Strip(block.content))
 	}

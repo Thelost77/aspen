@@ -69,10 +69,12 @@ go build -o aspen .
 
 1. Test PNG/JPEG and HEIC/HEIF attachments in Ghostty.
 2. Confirm each image remains inside its message outline.
-3. Scroll an image partly behind the top and bottom of history; Ghostty must keep the visible cropped portion without covering header or composer.
-4. Open help while a Kitty image is visible; the placement must disappear until help closes.
-5. Repeat in iTerm2 and confirm full images render without low-quality block fallback.
-6. Use `--graphics kitty`, `--graphics iterm2`, and `--graphics off` for protocol diagnosis.
+3. Scroll an image partly behind the top and bottom of history; Ghostty must clip its placeholder rows without covering the header or composer.
+4. Open and close help repeatedly while a Kitty image is visible; its placeholders must disappear and return each time.
+5. Press `R` and confirm visible images return after terminal-side image loss.
+6. Load image-heavy history and confirm Aspen processes only visible and near-visible attachments.
+7. Repeat in iTerm2 and confirm full images render without low-quality block fallback.
+8. Use `--graphics kitty`, `--graphics iterm2`, and `--graphics off` for protocol diagnosis.
 
 ### Draft safety
 
