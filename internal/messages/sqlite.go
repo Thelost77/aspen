@@ -2,6 +2,7 @@ package messages
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,6 +59,19 @@ JOIN aggregate_messages a ON a.chat_id = c.ROWID
 JOIN visible v ON v.chat_id = c.ROWID AND v.row_number = 1
 ORDER BY a.last_message_date DESC, c.ROWID DESC
 LIMIT ?`
+
+func (s *SQLiteStore) ChangeVersion(ctx context.Context) (int64, error) {
+	s.changeConnLock.Lock()
+	defer s.changeConnLock.Unlock()
+	if s.changeConn == nil {
+		return 0, classifyDatabaseError("load change version", errors.New("change detector is closed"))
+	}
+	var version int64
+	if err := s.changeConn.QueryRowContext(ctx, `PRAGMA data_version`).Scan(&version); err != nil {
+		return 0, classifyDatabaseError("load change version", err)
+	}
+	return version, nil
+}
 
 func (s *SQLiteStore) Conversations(ctx context.Context, limit int) ([]Chat, error) {
 	if limit <= 0 {

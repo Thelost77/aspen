@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -43,8 +44,9 @@ func IsDatabaseError(err error, kind ErrorKind) bool {
 }
 
 type SQLiteStore struct {
-	db   *sql.DB
-	path string
+	db             *sql.DB
+	changeConn     *sql.Conn
+	changeConnLock sync.Mutex
 }
 
 func DefaultDatabasePath() string {
@@ -75,8 +77,8 @@ func Open(path string) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, classifyDatabaseError("open", err)
 	}
-	db.SetMaxOpenConns(2)
-	db.SetMaxIdleConns(2)
+	db.SetMaxOpenConns(3)
+	db.SetMaxIdleConns(3)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -85,8 +87,14 @@ func Open(path string) (*SQLiteStore, error) {
 		return nil, classifyDatabaseError("connect", err)
 	}
 
-	store := &SQLiteStore{db: db, path: expanded}
+	changeConn, err := db.Conn(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, classifyDatabaseError("open change detector", err)
+	}
+	store := &SQLiteStore{db: db, changeConn: changeConn}
 	if err := store.validate(ctx); err != nil {
+		_ = changeConn.Close()
 		_ = db.Close()
 		return nil, err
 	}
@@ -97,7 +105,14 @@ func (s *SQLiteStore) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
-	return s.db.Close()
+	s.changeConnLock.Lock()
+	var changeConnErr error
+	if s.changeConn != nil {
+		changeConnErr = s.changeConn.Close()
+		s.changeConn = nil
+	}
+	s.changeConnLock.Unlock()
+	return errors.Join(changeConnErr, s.db.Close())
 }
 
 var requiredSchema = map[string][]string{

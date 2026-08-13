@@ -36,19 +36,35 @@ func (f *fakeMessageSender) Send(_ context.Context, target msgsender.SendTarget,
 }
 
 type fakeStore struct {
-	chats       []messages.Chat
-	histories   map[messages.ChatID]messages.HistoryPage
-	chatErr     error
-	historyErrs map[messages.ChatID]error
-	closed      bool
+	chats             []messages.Chat
+	histories         map[messages.ChatID]messages.HistoryPage
+	changeVersion     int64
+	chatErr           error
+	historyErrs       map[messages.ChatID]error
+	changeVersionErr  error
+	conversationCalls int
+	historyCalls      int
+	historyIDs        []messages.ChatID
+	calls             []string
+	closed            bool
 }
 
 func (f *fakeStore) Conversations(context.Context, int) ([]messages.Chat, error) {
+	f.conversationCalls++
+	f.calls = append(f.calls, "conversations")
 	return append([]messages.Chat(nil), f.chats...), f.chatErr
 }
 
 func (f *fakeStore) History(_ context.Context, id messages.ChatID, _ int, _ *messages.HistoryCursor) (messages.HistoryPage, error) {
+	f.historyCalls++
+	f.historyIDs = append(f.historyIDs, id)
+	f.calls = append(f.calls, "history")
 	return f.histories[id], f.historyErrs[id]
+}
+
+func (f *fakeStore) ChangeVersion(context.Context) (int64, error) {
+	f.calls = append(f.calls, "change-version")
+	return f.changeVersion, f.changeVersionErr
 }
 
 func (f *fakeStore) Close() error {
@@ -73,8 +89,9 @@ func testHistories() map[messages.ChatID]messages.HistoryPage {
 }
 
 func newTestModel() (Model, *fakeStore) {
-	store := &fakeStore{chats: testChats(), histories: testHistories(), historyErrs: make(map[messages.ChatID]error)}
+	store := &fakeStore{chats: testChats(), histories: testHistories(), changeVersion: 21, historyErrs: make(map[messages.ChatID]error)}
 	model := NewWithStore(store)
+	model.messagePollInterval = 0
 	model.now = func() time.Time { return time.Date(2026, 8, 5, 14, 32, 0, 0, time.Local) }
 	result, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return result.(Model), store
@@ -121,18 +138,286 @@ func loadTestModel(t *testing.T) (Model, *fakeStore) {
 
 func loadTestModelWithSender(t *testing.T) (Model, *fakeStore, *fakeMessageSender) {
 	t.Helper()
-	store := &fakeStore{chats: testChats(), histories: testHistories(), historyErrs: make(map[messages.ChatID]error)}
+	store := &fakeStore{chats: testChats(), histories: testHistories(), changeVersion: 21, historyErrs: make(map[messages.ChatID]error)}
 	messageSender := &fakeMessageSender{}
 	model := NewWithStore(store, messageSender)
+	model.messagePollInterval = 0
 	model.now = func() time.Time { return time.Date(2026, 8, 5, 14, 32, 0, 0, time.Local) }
 	result, _ := model.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	model = executeCmd(t, result.(Model), result.(Model).Init())
 	return model, store, messageSender
 }
 
+func TestMessagePollingRefreshesOnlyChangedData(t *testing.T) {
+	model, store := loadTestModel(t)
+	if len(store.calls) < 3 || store.calls[0] != "change-version" || store.calls[1] != "change-version" || store.calls[2] != "conversations" {
+		t.Fatalf("startup calls = %v, want change versions before conversations", store.calls)
+	}
+
+	conversationCalls := store.conversationCalls
+	historyCalls := store.historyCalls
+	updated, cmd := model.Update(messagePollTickMsg{})
+	model = executeCmd(t, updated.(Model), cmd)
+	if store.conversationCalls != conversationCalls || store.historyCalls != historyCalls {
+		t.Fatalf("unchanged token reloaded data: conversations=%d history=%d", store.conversationCalls, store.historyCalls)
+	}
+
+	store.changeVersion = 22
+	store.chats[0].LastMessageText = "new preview"
+	store.histories[1] = messages.HistoryPage{Messages: append(
+		append([]messages.Message(nil), store.histories[1].Messages...),
+		messages.Message{ID: 22, ChatID: 1, Text: "new body", SentAt: time.Now()},
+	)}
+	updated, cmd = model.Update(messagePollTickMsg{})
+	model = executeCmd(t, updated.(Model), cmd)
+
+	if store.conversationCalls != conversationCalls+1 || store.historyCalls != historyCalls+1 {
+		t.Fatalf("selected-chat change loads: conversations=%d history=%d", store.conversationCalls, store.historyCalls)
+	}
+	if model.messageChangeVersion != 22 {
+		t.Fatalf("change version = %d, want 22", model.messageChangeVersion)
+	}
+	if got := model.chatByID[1].LastMessageText; got != "new preview" {
+		t.Fatalf("preview = %q, want new preview", got)
+	}
+	if got := model.threads[1].messages[len(model.threads[1].messages)-1].ID; got != 22 {
+		t.Fatalf("latest rendered message = %d, want 22", got)
+	}
+}
+
+func TestMessagePollingPreservesLoadedHistoryAndLoadAll(t *testing.T) {
+	model, store := loadTestModel(t)
+	state := model.threads[1]
+	state.messages = make([]messages.Message, 150)
+	for i := range state.messages {
+		state.messages[i] = messages.Message{ID: messages.MessageID(i + 1), ChatID: 1, Text: fmt.Sprintf("message %d", i+1)}
+	}
+	state.older = &messages.HistoryCursor{Date: 1, MessageID: 1}
+	state.loadingAll = true
+	store.changeVersion = 22
+	store.histories[1] = messages.HistoryPage{Messages: []messages.Message{
+		{ID: 150, ChatID: 1, Text: "updated 150"},
+		{ID: 151, ChatID: 1, Text: "new 151"},
+	}}
+
+	updated, cmd := model.Update(messagePollTickMsg{})
+	model = executeCmd(t, updated.(Model), cmd)
+	state = model.threads[1]
+	if len(state.messages) != 151 || state.messages[149].Text != "updated 150" || state.messages[150].ID != 151 {
+		t.Fatalf("merged history was not preserved: count=%d tail=%#v", len(state.messages), state.messages[149:])
+	}
+	if !state.loadingAll || state.older == nil {
+		t.Fatalf("background refresh changed load-all state: loadingAll=%v older=%v", state.loadingAll, state.older)
+	}
+}
+
+func TestMessagePollingDefersMergeUntilCurrentHistoryLoadFinishes(t *testing.T) {
+	model, store := loadTestModel(t)
+	state := model.threads[1]
+	state.loading = true
+	store.changeVersion = 22
+
+	updated, checkCmd := model.Update(messagePollTickMsg{})
+	model = updated.(Model)
+	updated, refreshCmd := model.Update(checkCmd())
+	model = updated.(Model)
+	if !model.pendingLatestMerges[1] {
+		t.Fatal("busy selected history did not queue a latest-page merge")
+	}
+	_ = refreshCmd
+
+	state.loading = false
+	updated, mergeCmd := model.Update(HistoryLoadedMsg{
+		ChatID: 1, Generation: state.generation, Page: store.histories[1], LoadedAt: time.Now(),
+	})
+	model = updated.(Model)
+	if mergeCmd == nil || model.pendingLatestMerges[1] {
+		t.Fatal("completed history did not start the queued latest-page merge")
+	}
+	model = executeCmd(t, model, mergeCmd)
+	if model.threads[1].loading {
+		t.Fatal("queued latest-page merge did not settle")
+	}
+}
+
+func TestMessagePollingDefersMergeUntilOlderLoadFinishes(t *testing.T) {
+	model, store := loadTestModel(t)
+	state := model.threads[1]
+	state.loadingOlder = true
+	store.changeVersion = 22
+
+	updated, checkCmd := model.Update(messagePollTickMsg{})
+	model = updated.(Model)
+	updated, refreshCmd := model.Update(checkCmd())
+	model = updated.(Model)
+	if !model.pendingLatestMerges[1] {
+		t.Fatal("older load did not queue a latest-page merge")
+	}
+	_ = refreshCmd
+
+	updated, mergeCmd := model.Update(HistoryLoadedMsg{
+		ChatID: 1, Generation: state.generation, Prepend: true, Page: messages.HistoryPage{Messages: []messages.Message{}}, LoadedAt: time.Now(),
+	})
+	model = updated.(Model)
+	if mergeCmd == nil || model.pendingLatestMerges[1] {
+		t.Fatal("completed older load did not start the queued latest-page merge")
+	}
+	model = executeCmd(t, model, mergeCmd)
+	if model.threads[1].loading {
+		t.Fatal("queued latest-page merge did not settle")
+	}
+}
+
+func TestFailedLatestMergeRetriesOnNextPoll(t *testing.T) {
+	model, _ := loadTestModel(t)
+	state := model.threads[1]
+	state.generation++
+	state.loading = true
+	state.err = nil
+	updated, _ := model.Update(HistoryLoadedMsg{
+		ChatID: 1, Generation: state.generation, MergeLatest: true, Err: fmt.Errorf("busy"), LoadedAt: time.Now(),
+	})
+	model = updated.(Model)
+	if !model.pendingLatestMerges[1] {
+		t.Fatal("failed latest-page merge was not retained for retry")
+	}
+
+	updated, cmd := model.Update(messagePollTickMsg{})
+	model = executeCmd(t, updated.(Model), cmd)
+	if model.pendingLatestMerges[1] || model.threads[1].loading {
+		t.Fatal("next poll did not settle the retained latest-page merge")
+	}
+}
+
+func TestMessagePollingIgnoresTransientCursorErrors(t *testing.T) {
+	model, store := loadTestModel(t)
+	conversationCalls := store.conversationCalls
+	historyCalls := store.historyCalls
+	store.changeVersionErr = fmt.Errorf("busy")
+
+	updated, cmd := model.Update(messagePollTickMsg{})
+	model = executeCmd(t, updated.(Model), cmd)
+	if store.conversationCalls != conversationCalls || store.historyCalls != historyCalls {
+		t.Fatal("cursor error reloaded data")
+	}
+	if model.fatalErr != nil || model.bannerErr != nil {
+		t.Fatalf("cursor error reached UI: fatal=%v banner=%v", model.fatalErr, model.bannerErr)
+	}
+}
+
+func TestAutomaticRefreshCompletionOrderDoesNotMatter(t *testing.T) {
+	for _, historyFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("historyFirst=%v", historyFirst), func(t *testing.T) {
+			model, store := loadTestModel(t)
+			store.changeVersion = 22
+			updated, checkCmd := model.Update(messagePollTickMsg{})
+			model = updated.(Model)
+			changeMsg := checkCmd()
+			updated, refreshCmd := model.Update(changeMsg)
+			model = updated.(Model)
+			refreshMsg := refreshCmd()
+			batch, ok := refreshMsg.(tea.BatchMsg)
+			if !ok || len(batch) != 2 {
+				t.Fatalf("refresh command = %T", refreshMsg)
+			}
+			messagesByType := make(map[string]tea.Msg)
+			for _, cmd := range batch {
+				msg := cmd()
+				messagesByType[fmt.Sprintf("%T", msg)] = msg
+			}
+			ordered := []tea.Msg{messagesByType["app.ChatsLoadedMsg"], messagesByType["app.HistoryLoadedMsg"]}
+			if historyFirst {
+				ordered[0], ordered[1] = ordered[1], ordered[0]
+			}
+			for _, msg := range ordered {
+				updated, _ = model.Update(msg)
+				model = updated.(Model)
+			}
+			if model.messageChangeVersion != 22 || model.loadingChats || model.threads[1].loading {
+				t.Fatalf("settled state: token=%d loadingChats=%v loadingHistory=%v", model.messageChangeVersion, model.loadingChats, model.threads[1].loading)
+			}
+		})
+	}
+}
+
+func TestManualRefreshDoesNotCauseDuplicateAutomaticRefresh(t *testing.T) {
+	model, store := loadTestModel(t)
+	store.changeVersion = 22
+
+	updated, refreshCmd := model.refresh()
+	model = executeCmd(t, updated.(Model), refreshCmd)
+	conversationCalls := store.conversationCalls
+	historyCalls := store.historyCalls
+
+	updated, pollCmd := model.Update(messagePollTickMsg{})
+	_ = executeCmd(t, updated.(Model), pollCmd)
+	if store.conversationCalls != conversationCalls || store.historyCalls != historyCalls {
+		t.Fatal("poll repeated a completed manual refresh")
+	}
+}
+
+func TestChangeVersionRollbackTriggersFullRefresh(t *testing.T) {
+	model, store := loadTestModel(t)
+	model.messageChangeVersion = 50
+	store.changeVersion = 1
+	conversationCalls := store.conversationCalls
+	historyCalls := store.historyCalls
+
+	updated, cmd := model.Update(messagePollTickMsg{})
+	model = executeCmd(t, updated.(Model), cmd)
+	if store.conversationCalls != conversationCalls+1 || store.historyCalls != historyCalls+1 {
+		t.Fatalf("rollback loads: conversations=%d history=%d", store.conversationCalls-conversationCalls, store.historyCalls-historyCalls)
+	}
+	if model.messageChangeVersion != 1 {
+		t.Fatalf("rollback token = %d, want 1", model.messageChangeVersion)
+	}
+}
+
+func TestInFlightPollDoesNotSupersedeManualRefresh(t *testing.T) {
+	model, store := loadTestModel(t)
+	store.changeVersion = 22
+	updated, checkCmd := model.Update(messagePollTickMsg{})
+	model = updated.(Model)
+
+	updated, refreshCmd := model.refresh()
+	model = updated.(Model)
+	chatGeneration := model.chatGeneration
+	historyGeneration := model.threads[model.selectedID].generation
+	updated, cmd := model.Update(checkCmd())
+	model = updated.(Model)
+	if model.chatGeneration != chatGeneration || model.threads[model.selectedID].generation != historyGeneration {
+		t.Fatal("in-flight poll superseded manual refresh generations")
+	}
+	if cmd != nil {
+		t.Fatal("in-flight poll started refresh work")
+	}
+	_ = refreshCmd
+}
+
+func TestMessagePollingWaitsForRefreshInProgress(t *testing.T) {
+	model, _ := loadTestModel(t)
+	updated, refreshCmd := model.refresh()
+	model = updated.(Model)
+	if refreshCmd == nil || !model.loadingChats {
+		t.Fatal("manual refresh did not start")
+	}
+	chatGeneration := model.chatGeneration
+	historyGeneration := model.threads[model.selectedID].generation
+
+	updated, duplicateCmd := model.Update(messagePollTickMsg{})
+	model = updated.(Model)
+	if duplicateCmd != nil {
+		t.Fatal("pending refresh scheduled database work")
+	}
+	if model.chatGeneration != chatGeneration || model.threads[model.selectedID].generation != historyGeneration {
+		t.Fatal("pending refresh advanced load generations")
+	}
+}
+
 func TestContactsEnrichDisplayOnlyAndDoNotBlockStartup(t *testing.T) {
-	store := &fakeStore{chats: testChats(), histories: testHistories(), historyErrs: make(map[messages.ChatID]error)}
+	store := &fakeStore{chats: testChats(), histories: testHistories(), changeVersion: 21, historyErrs: make(map[messages.ChatID]error)}
 	model := NewWithStore(store)
+	model.messagePollInterval = 0
 	model.SetResolverLoader(func() (NameResolver, error) {
 		return mapResolver{
 			"+15550000001": "Alice Resolved",
@@ -180,8 +465,13 @@ func TestStartupLoadsChatsAndFirstHistory(t *testing.T) {
 func TestLateHistoryCannotRenderUnderAnotherChat(t *testing.T) {
 	model, _ := newTestModel()
 
-	chatsMsg := model.Init()()
-	updated, historyACmd := model.Update(chatsMsg)
+	changeVersionMsg := model.Init()()
+	updated, chatsCmd := model.Update(changeVersionMsg)
+	model = updated.(Model)
+	if chatsCmd == nil {
+		t.Fatal("startup did not request conversations")
+	}
+	updated, historyACmd := model.Update(chatsCmd())
 	model = updated.(Model)
 	if historyACmd == nil {
 		t.Fatal("startup did not request first history")
@@ -509,6 +799,32 @@ func TestLateSendSuccessCannotClearAnotherChatDraft(t *testing.T) {
 	}
 	if model.drafts[1].text != "" {
 		t.Fatalf("matching A draft was not cleared: %q", model.drafts[1].text)
+	}
+}
+
+func TestLateSendSuccessRefreshesCapturedChat(t *testing.T) {
+	model, store, _ := loadTestModelWithSender(t)
+	model.pending[1] = pendingSend{generation: 1, draftGeneration: 1, text: "send A"}
+	model.drafts[1] = &draftState{text: "send A", generation: 1}
+	model.selectedID = 2
+	model.chatList.SelectID(2)
+	historyCalls := store.historyCalls
+
+	updated, cmd := model.Update(SendFinishedMsg{ChatID: 1, Generation: 1, DraftGeneration: 1})
+	model = executeCmd(t, updated.(Model), cmd)
+	refreshedIDs := store.historyIDs[historyCalls:]
+	foundCapturedChat := false
+	for _, chatID := range refreshedIDs {
+		foundCapturedChat = foundCapturedChat || chatID == 1
+	}
+	if !foundCapturedChat {
+		t.Fatalf("late send history IDs = %v, want captured chat 1", refreshedIDs)
+	}
+	if !model.threads[1].loaded || model.threads[1].loading {
+		t.Fatal("captured send chat did not refresh")
+	}
+	if model.selectedID != 2 {
+		t.Fatalf("late send changed selection to %d", model.selectedID)
 	}
 }
 

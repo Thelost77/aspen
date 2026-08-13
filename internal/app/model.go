@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	minimumSidebarWidth      = 24
-	preferredSidebarWidth    = 30
-	minimumConversationWidth = 48
+	minimumSidebarWidth        = 24
+	preferredSidebarWidth      = 30
+	minimumConversationWidth   = 48
+	defaultMessagePollInterval = 2 * time.Second
 )
 
 type Focus int
@@ -125,6 +126,11 @@ type Model struct {
 	status            string
 	lastRefreshed     time.Time
 	now               func() time.Time
+
+	messagePollInterval  time.Duration
+	messagePollLoading   bool
+	messageChangeVersion int64
+	pendingLatestMerges  map[messages.ChatID]bool
 }
 
 func New(opener StoreOpener, senders ...msgsender.Sender) Model {
@@ -175,6 +181,8 @@ func newModel(opener StoreOpener, store messages.Store, messageSender msgsender.
 		loadingChats:              true,
 		status:                    "Loading conversations…",
 		now:                       time.Now,
+		messagePollInterval:       defaultMessagePollInterval,
+		pendingLatestMerges:       make(map[messages.ChatID]bool),
 	}
 	return model
 }
@@ -186,7 +194,7 @@ func (m *Model) SetInlineImageProtocol(protocol inlineimage.Protocol) {
 func (m Model) Init() tea.Cmd {
 	var commands []tea.Cmd
 	if m.store != nil {
-		commands = append(commands, loadChatsCmd(m.store, m.chatGeneration))
+		commands = append(commands, loadChangeVersionCmd(m.store, true))
 	} else if m.opener != nil {
 		commands = append(commands, openStoreCmd(m.opener, m.openGeneration))
 	} else {
@@ -257,7 +265,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingChats = true
 		m.status = "Loading conversations…"
 		m.chatGeneration++
-		return m, loadChatsCmd(m.store, m.chatGeneration)
+		m.messagePollLoading = true
+		return m, loadChangeVersionCmd(m.store, true)
+
+	case messagePollTickMsg:
+		if m.store == nil || m.messagePollLoading || m.loadingChats {
+			return m, scheduleMessagePoll(m.messagePollInterval)
+		}
+		m.messagePollLoading = true
+		return m, tea.Batch(
+			loadChangeVersionCmd(m.store, false),
+			m.startPendingLatestMerge(m.selectedID),
+		)
+
+	case changeVersionLoadedMsg:
+		if !msg.Initial && m.loadingChats {
+			m.messagePollLoading = false
+			return m, scheduleMessagePoll(m.messagePollInterval)
+		}
+		m.messagePollLoading = false
+		if msg.Initial {
+			if msg.Err == nil {
+				m.messageChangeVersion = msg.Version
+			}
+			return m, tea.Batch(
+				loadChatsCmd(m.store, m.chatGeneration),
+				scheduleMessagePoll(m.messagePollInterval),
+			)
+		}
+		nextPoll := scheduleMessagePoll(m.messagePollInterval)
+		if msg.Err != nil || msg.Version == m.messageChangeVersion {
+			return m, nextPoll
+		}
+		if msg.Version < m.messageChangeVersion {
+			m.messageChangeVersion = msg.Version
+			return m, m.refreshChat(m.selectedID, nextPoll)
+		}
+		cmds := []tea.Cmd{nextPoll}
+		m.chatGeneration++
+		m.loadingChats = true
+		m.status = "Refreshing…"
+		cmds = append(cmds, loadChatsCmd(m.store, m.chatGeneration))
+		if m.selectedID != 0 {
+			cmds = append(cmds, m.startLatestHistoryMerge(m.selectedID))
+		}
+		return m, tea.Batch(cmds...)
 
 	case ChatsLoadedMsg:
 		if msg.Generation != m.chatGeneration {
@@ -273,6 +325,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Refresh failed"
 			}
 			return m, nil
+		}
+		if msg.ChangeVersion > 0 {
+			m.messageChangeVersion = msg.ChangeVersion
 		}
 		m.fatalErr = nil
 		m.bannerErr = nil
@@ -320,7 +375,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				state.loadingAll = false
 				m.bannerErr = msg.Err
 				m.status = "Older message load failed"
-				return m, nil
+				return m, m.startPendingLatestMerge(msg.ChatID)
 			}
 			oldOffset := state.offset
 			oldLineCount := 0
@@ -351,7 +406,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				state.offset = m.viewport.YOffset
 				imageCmd = m.refreshInlineImages()
 			}
-			return m, tea.Batch(imageCmd, nextPageCmd)
+			return m, tea.Batch(imageCmd, nextPageCmd, m.startPendingLatestMerge(msg.ChatID))
 		}
 
 		state.loading = false
@@ -363,13 +418,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.ChatID == m.selectedID {
 				m.syncViewport(false)
 			}
-			return m, nil
+			if msg.MergeLatest {
+				m.pendingLatestMerges[msg.ChatID] = true
+				return m, nil
+			}
+			return m, m.startPendingLatestMerge(msg.ChatID)
 		}
 		wasLoaded := state.loaded
 		wasAtBottom := msg.ChatID == m.selectedID && m.viewport.AtBottom()
 		oldOffset := state.offset
-		state.messages = m.enrichMessages(msg.Page.Messages)
-		state.older = cloneCursor(msg.Page.Older)
+		if msg.MergeLatest {
+			state.messages = mergeLatestMessages(state.messages, m.enrichMessages(msg.Page.Messages))
+		} else {
+			state.messages = m.enrichMessages(msg.Page.Messages)
+			state.older = cloneCursor(msg.Page.Older)
+		}
 		state.loaded = true
 		state.err = nil
 		m.bannerErr = nil
@@ -389,7 +452,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			state.offset = m.viewport.YOffset
 			imageCmd = m.refreshInlineImages()
 		}
-		return m, imageCmd
+		return m, tea.Batch(imageCmd, m.startPendingLatestMerge(msg.ChatID))
 
 	case ContactsLoadedMsg:
 		if msg.Generation != m.contactGeneration {
@@ -591,17 +654,22 @@ func (m Model) refresh() (tea.Model, tea.Cmd) {
 	if m.store == nil {
 		return m.retryOpen()
 	}
+	return m, m.refreshChat(m.selectedID)
+}
+
+func (m *Model) refreshChat(chatID messages.ChatID, commands ...tea.Cmd) tea.Cmd {
 	m.chatGeneration++
 	m.loadingChats = true
 	m.status = "Refreshing…"
-	cmds := []tea.Cmd{loadChatsCmd(m.store, m.chatGeneration)}
-	if m.selectedID != 0 {
-		cmds = append(cmds, m.startHistoryLoad(m.selectedID))
+	commands = append(commands, loadChatsCmd(m.store, m.chatGeneration))
+	if chatID != 0 {
+		commands = append(commands, m.startHistoryLoad(chatID))
 	}
-	return m, tea.Batch(cmds...)
+	return tea.Batch(commands...)
 }
 
 func (m *Model) startHistoryLoad(chatID messages.ChatID) tea.Cmd {
+	delete(m.pendingLatestMerges, chatID)
 	m.cancelInlineImageLoads(chatID)
 	state := m.threads[chatID]
 	if state == nil {
@@ -616,7 +684,40 @@ func (m *Model) startHistoryLoad(chatID messages.ChatID) tea.Cmd {
 	if chatID == m.selectedID {
 		m.syncViewport(false)
 	}
-	return loadHistoryCmd(m.store, chatID, state.generation, nil, false)
+	return loadHistoryCmd(m.store, chatID, state.generation, nil, false, false)
+}
+
+func (m *Model) startLatestHistoryMerge(chatID messages.ChatID) tea.Cmd {
+	state := m.threads[chatID]
+	if m.store == nil || state == nil {
+		return nil
+	}
+	if !state.loaded {
+		if state.loading {
+			m.pendingLatestMerges[chatID] = true
+		}
+		return nil
+	}
+	if state.loading || state.loadingOlder {
+		m.pendingLatestMerges[chatID] = true
+		return nil
+	}
+	state.generation++
+	state.loading = true
+	state.err = nil
+	return loadHistoryCmd(m.store, chatID, state.generation, nil, false, true)
+}
+
+func (m *Model) startPendingLatestMerge(chatID messages.ChatID) tea.Cmd {
+	if !m.pendingLatestMerges[chatID] {
+		return nil
+	}
+	state := m.threads[chatID]
+	if state == nil || state.loading || state.loadingOlder {
+		return nil
+	}
+	delete(m.pendingLatestMerges, chatID)
+	return m.startLatestHistoryMerge(chatID)
 }
 
 func (m *Model) startOlderHistoryLoad() tea.Cmd {
@@ -634,7 +735,7 @@ func (m *Model) startOlderHistoryLoadFor(chatID messages.ChatID) tea.Cmd {
 	} else {
 		m.status = "Loading older messages…"
 	}
-	return loadHistoryCmd(m.store, chatID, state.generation, state.older, true)
+	return loadHistoryCmd(m.store, chatID, state.generation, state.older, true, false)
 }
 
 func (m *Model) toggleAllHistory() tea.Cmd {
@@ -878,6 +979,30 @@ func cloneCursor(cursor *messages.HistoryCursor) *messages.HistoryCursor {
 	}
 	copy := *cursor
 	return &copy
+}
+
+func mergeLatestMessages(current, latest []messages.Message) []messages.Message {
+	latestByID := make(map[messages.MessageID]messages.Message, len(latest))
+	for _, message := range latest {
+		latestByID[message.ID] = message
+	}
+	merged := make([]messages.Message, 0, len(current)+len(latest))
+	for _, message := range current {
+		if replacement, ok := latestByID[message.ID]; ok {
+			merged = append(merged, replacement)
+			delete(latestByID, message.ID)
+		} else {
+			merged = append(merged, message)
+		}
+	}
+	for _, message := range latest {
+		if _, ok := latestByID[message.ID]; !ok {
+			continue
+		}
+		merged = append(merged, message)
+		delete(latestByID, message.ID)
+	}
+	return merged
 }
 
 func prependUniqueMessages(older, current []messages.Message) []messages.Message {

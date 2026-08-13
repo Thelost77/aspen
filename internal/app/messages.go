@@ -19,19 +19,21 @@ type StoreOpenedMsg struct {
 }
 
 type ChatsLoadedMsg struct {
-	Generation uint64
-	Chats      []messages.Chat
-	LoadedAt   time.Time
-	Err        error
+	Generation    uint64
+	Chats         []messages.Chat
+	ChangeVersion int64
+	LoadedAt      time.Time
+	Err           error
 }
 
 type HistoryLoadedMsg struct {
-	ChatID     messages.ChatID
-	Generation uint64
-	Page       messages.HistoryPage
-	Prepend    bool
-	LoadedAt   time.Time
-	Err        error
+	ChatID      messages.ChatID
+	Generation  uint64
+	Page        messages.HistoryPage
+	Prepend     bool
+	MergeLatest bool
+	LoadedAt    time.Time
+	Err         error
 }
 
 type SendFinishedMsg struct {
@@ -39,6 +41,14 @@ type SendFinishedMsg struct {
 	Generation      uint64
 	DraftGeneration uint64
 	Err             error
+}
+
+type messagePollTickMsg struct{}
+
+type changeVersionLoadedMsg struct {
+	Initial bool
+	Version int64
+	Err     error
 }
 
 func openStoreCmd(opener StoreOpener, generation uint64) tea.Cmd {
@@ -50,18 +60,41 @@ func openStoreCmd(opener StoreOpener, generation uint64) tea.Cmd {
 	}
 }
 
+func loadChangeVersionCmd(store messages.Store, initial bool) tea.Cmd {
+	return func() tea.Msg {
+		started := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		version, err := store.ChangeVersion(ctx)
+		if err != nil {
+			logger.Debug("message change check failed", "duration_ms", time.Since(started).Milliseconds())
+		}
+		return changeVersionLoadedMsg{Initial: initial, Version: version, Err: err}
+	}
+}
+
+func scheduleMessagePoll(interval time.Duration) tea.Cmd {
+	if interval <= 0 {
+		return nil
+	}
+	return tea.Tick(interval, func(time.Time) tea.Msg {
+		return messagePollTickMsg{}
+	})
+}
+
 func loadChatsCmd(store messages.Store, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		changeVersion, _ := store.ChangeVersion(ctx)
 		chats, err := store.Conversations(ctx, 100)
 		logger.Debug("conversation load completed", "duration_ms", time.Since(started).Milliseconds(), "count", len(chats), "failed", err != nil)
-		return ChatsLoadedMsg{Generation: generation, Chats: chats, LoadedAt: time.Now(), Err: err}
+		return ChatsLoadedMsg{Generation: generation, Chats: chats, ChangeVersion: changeVersion, LoadedAt: time.Now(), Err: err}
 	}
 }
 
-func loadHistoryCmd(store messages.Store, chatID messages.ChatID, generation uint64, cursor *messages.HistoryCursor, prepend bool) tea.Cmd {
+func loadHistoryCmd(store messages.Store, chatID messages.ChatID, generation uint64, cursor *messages.HistoryCursor, prepend, mergeLatest bool) tea.Cmd {
 	cursor = cloneCursor(cursor)
 	return func() tea.Msg {
 		started := time.Now()
@@ -69,7 +102,7 @@ func loadHistoryCmd(store messages.Store, chatID messages.ChatID, generation uin
 		defer cancel()
 		page, err := store.History(ctx, chatID, 100, cursor)
 		logger.Debug("history load completed", "duration_ms", time.Since(started).Milliseconds(), "count", len(page.Messages), "older", prepend, "failed", err != nil)
-		return HistoryLoadedMsg{ChatID: chatID, Generation: generation, Page: page, Prepend: prepend, LoadedAt: time.Now(), Err: err}
+		return HistoryLoadedMsg{ChatID: chatID, Generation: generation, Page: page, Prepend: prepend, MergeLatest: mergeLatest, LoadedAt: time.Now(), Err: err}
 	}
 }
 

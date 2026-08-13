@@ -169,7 +169,7 @@ OSC 1337 has no source-cropping operation, so iTerm2 only places an image while 
 
 ## Refresh and history
 
-Aspen does not poll Messages continuously. It refreshes on startup, when selecting a conversation, on `r`, and after a successful local send.
+While Aspen is open, it checks SQLite's change version every two seconds with a lightweight read-only query. It reloads the conversation list and merges the latest page into the selected conversation only when the database changed. Polling stops when Aspen exits. Aspen also refreshes on startup, when selecting a conversation, on `r`, and after a successful local send.
 
 History loads through read-only keyset pages. Press `A` to chain pages until the complete conversation is loaded. Press `A` again to stop after the current page.
 
@@ -197,7 +197,7 @@ The directory is `0700`; log files and rotated logs are `0600`.
 - Group and RCS sending disabled
 - Attachments are view-only
 - No reactions, edits, replies, read receipts, or typing indicators
-- No background polling or filesystem watcher
+- No daemon or filesystem watcher; polling runs only while Aspen is open
 - Private Apple schemas can change between macOS releases
 
 ## Development

@@ -135,6 +135,96 @@ func TestOpenRejectsMissingAndUnsupportedDatabase(t *testing.T) {
 	}
 }
 
+func TestChangeVersionTracksExternalWALCommits(t *testing.T) {
+	t.Parallel()
+	path := createFixture(t)
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := writer.Close(); err != nil {
+			t.Errorf("close writer: %v", err)
+		}
+	}()
+	if _, err := writer.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+
+	baseline, err := store.ChangeVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`INSERT INTO message VALUES (401, 'msg-401', 'delayed', NULL, 700000000000000600, 0, 0, 'iMessage', 1, 0, 0, 0, 0, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	afterMessage, err := store.ChangeVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterMessage == baseline {
+		t.Fatal("message commit did not change data_version")
+	}
+
+	if _, err := writer.Exec(`INSERT INTO chat_message_join VALUES (1, 401)`); err != nil {
+		t.Fatal(err)
+	}
+	afterJoin, err := store.ChangeVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterJoin == afterMessage {
+		t.Fatal("delayed join commit did not change data_version")
+	}
+}
+
+func TestChangeVersionUsesOnePersistentConnection(t *testing.T) {
+	t.Parallel()
+	path := createFixture(t)
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+
+	baseline, err := store.ChangeVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(`UPDATE message SET is_read = 1 WHERE ROWID = 101`); err != nil {
+		_ = writer.Close()
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := store.ChangeVersion(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == baseline {
+		t.Fatal("change version did not advance after the writer connection closed")
+	}
+}
+
 func TestConversations(t *testing.T) {
 	t.Parallel()
 	store, err := Open(createFixture(t))
