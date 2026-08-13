@@ -39,11 +39,17 @@ func (p Protocol) String() string {
 	}
 }
 
-func DetectTerminal() Protocol {
+func DetectTerminalWithSource() (Protocol, string) {
 	if protocol := Detect(os.Getenv); protocol != Unsupported {
-		return protocol
+		return protocol, "environment"
 	}
-	return protocolOrSSHFallback(probeTerminal("/dev/tty", terminalProbeTimeout), os.Getenv)
+	if protocol := probeTerminal("/dev/tty", terminalProbeTimeout); protocol != Unsupported {
+		return protocol, "probe"
+	}
+	if protocol := protocolOrSSHFallback(Unsupported, os.Getenv); protocol != Unsupported {
+		return protocol, "ssh_fallback"
+	}
+	return Unsupported, "unsupported"
 }
 
 func protocolOrSSHFallback(detected Protocol, getenv func(string) string) Protocol {

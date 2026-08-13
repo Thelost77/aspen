@@ -82,7 +82,7 @@ Logs rotate locally at 5 MB. Aspen has no telemetry.
 
 Attachment paths come from the local Messages database and are used only for display. Aspen checks that an image is a regular file below the source-size limit, bounds decoded pixel count, resizes transfer payloads, and encodes terminal output locally.
 
-HEIC/HEIF files are converted with `/usr/bin/sips` into owner-only temporary files. Temporary files are removed after encoding. Ghostty uses Kitty graphics; iTerm2 uses OSC 1337. Kitty placement IDs are deleted before redraws, overlays, and shutdown.
+HEIC/HEIF files are converted with `/usr/bin/sips` into owner-only temporary files. Temporary files are removed after encoding. Ghostty uses Kitty Unicode placeholders; iTerm2 uses OSC 1337. Aspen processes visible and near-visible attachments with two workers. It cancels stale work after chat and layout changes. A byte-bounded cache evicts least-recently-visible payloads. Aspen frees Kitty terminal data after images leave the viewport and deletes remaining resident data on shutdown.
 
 ## Trust boundary
 

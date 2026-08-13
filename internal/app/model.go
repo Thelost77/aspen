@@ -48,6 +48,7 @@ const (
 type threadState struct {
 	messages     []messages.Message
 	placements   []inlinePlacement
+	imageRefs    []inlineImageRef
 	older        *messages.HistoryCursor
 	generation   uint64
 	loading      bool
@@ -83,15 +84,25 @@ type Model struct {
 	composer textarea.Model
 	search   conversationSearchState
 
-	chats          []messages.Chat
-	chatByID       map[messages.ChatID]messages.Chat
-	selectedID     messages.ChatID
-	threads        map[messages.ChatID]*threadState
-	drafts         map[messages.ChatID]*draftState
-	pending        map[messages.ChatID]pendingSend
-	inlineImages   map[inlineImageKey]*inlineImageState
-	imageProtocol  inlineimage.Protocol
-	sendGeneration uint64
+	chats                       []messages.Chat
+	chatByID                    map[messages.ChatID]messages.Chat
+	selectedID                  messages.ChatID
+	threads                     map[messages.ChatID]*threadState
+	drafts                      map[messages.ChatID]*draftState
+	pending                     map[messages.ChatID]pendingSend
+	inlineImages                map[inlineImageKey]*inlineImageState
+	inlineImageResidents        map[inlineImageKey]bool
+	inlineImageITermPositions   map[inlineImageKey]inlineImagePosition
+	inlineImageLoader           *inlineImageLoader
+	inlineImageOutput           inlineimage.TerminalOutput
+	imageProtocol               inlineimage.Protocol
+	inlineImageBytes            int
+	inlineImageCacheBudget      int
+	inlineImageGeneration       uint64
+	inlineImageLayoutGeneration uint64
+	inlineImageFrameGeneration  uint64
+	inlineImageAccess           uint64
+	sendGeneration              uint64
 
 	focus                    Focus
 	layout                   Layout
@@ -143,31 +154,35 @@ func newModel(opener StoreOpener, store messages.Store, messageSender msgsender.
 	composer := newComposer(styles)
 	vp.MouseWheelEnabled = false
 	model := Model{
-		opener:              opener,
-		store:               store,
-		messageSender:       messageSender,
-		styles:              styles,
-		help:                ui.NewHelpOverlay(styles),
-		chatList:            newChatList(styles),
-		viewport:            vp,
-		composer:            composer,
-		search:              newConversationSearch(styles),
-		chatByID:            make(map[messages.ChatID]messages.Chat),
-		threads:             make(map[messages.ChatID]*threadState),
-		drafts:              make(map[messages.ChatID]*draftState),
-		pending:             make(map[messages.ChatID]pendingSend),
-		inlineImages:        make(map[inlineImageKey]*inlineImageState),
-		imageProtocol:       inlineimage.Detect(os.Getenv),
-		focus:               FocusList,
-		narrowPane:          NarrowList,
-		openGeneration:      1,
-		chatGeneration:      1,
-		contactGeneration:   1,
-		loadingChats:        true,
-		status:              "Loading conversations…",
-		now:                 time.Now,
-		messagePollInterval: defaultMessagePollInterval,
-		pendingLatestMerges: make(map[messages.ChatID]bool),
+		opener:                    opener,
+		store:                     store,
+		messageSender:             messageSender,
+		styles:                    styles,
+		help:                      ui.NewHelpOverlay(styles),
+		chatList:                  newChatList(styles),
+		viewport:                  vp,
+		composer:                  composer,
+		search:                    newConversationSearch(styles),
+		chatByID:                  make(map[messages.ChatID]messages.Chat),
+		threads:                   make(map[messages.ChatID]*threadState),
+		drafts:                    make(map[messages.ChatID]*draftState),
+		pending:                   make(map[messages.ChatID]pendingSend),
+		inlineImages:              make(map[inlineImageKey]*inlineImageState),
+		inlineImageResidents:      make(map[inlineImageKey]bool),
+		inlineImageITermPositions: make(map[inlineImageKey]inlineImagePosition),
+		inlineImageLoader:         newInlineImageLoader(),
+		inlineImageCacheBudget:    defaultInlineImageCacheBudget,
+		imageProtocol:             inlineimage.Detect(os.Getenv),
+		focus:                     FocusList,
+		narrowPane:                NarrowList,
+		openGeneration:            1,
+		chatGeneration:            1,
+		contactGeneration:         1,
+		loadingChats:              true,
+		status:                    "Loading conversations…",
+		now:                       time.Now,
+		messagePollInterval:       defaultMessagePollInterval,
+		pendingLatestMerges:       make(map[messages.ChatID]bool),
 	}
 	return model
 }
@@ -194,10 +209,7 @@ func (m Model) Init() tea.Cmd {
 }
 
 func (m Model) Close() error {
-	var cleanupErr error
-	if cleanup := m.inlineImageCleanup(); cleanup != "" {
-		_, cleanupErr = os.Stdout.WriteString(cleanup)
-	}
+	cleanupErr := m.closeInlineImages()
 	if m.store == nil {
 		return cleanupErr
 	}
@@ -214,13 +226,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		oldColumns, oldRows := m.inlineImageDimensions()
 		m.width = msg.Width
 		m.height = msg.Height
 		m.help.SetSize(msg.Width, msg.Height)
 		m.setSizes()
-		imageCmd := m.startInlineImageLoads(m.selectedID)
+		newColumns, newRows := m.inlineImageDimensions()
+		if oldColumns != newColumns || oldRows != newRows {
+			m.invalidateInlineImageLayout()
+		} else {
+			m.resetInlineImageResidency()
+		}
 		m.syncViewport(false)
-		return m, imageCmd
+		return m, m.refreshInlineImages()
+
+	case tea.ResumeMsg:
+		m.resetInlineImageResidency()
+		return m, m.refreshInlineImages()
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
@@ -339,9 +361,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			historyCmd := m.startHistoryLoad(selected)
 			return m, tea.Batch(listCmd, historyCmd)
 		}
-		imageCmd := m.startInlineImageLoads(selected)
 		m.syncViewport(false)
-		return m, tea.Batch(listCmd, imageCmd)
+		return m, tea.Batch(listCmd, m.refreshInlineImages())
 
 	case HistoryLoadedMsg:
 		state := m.threads[msg.ChatID]
@@ -367,7 +388,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			state.err = nil
 			m.bannerErr = nil
 			m.refreshConversationSearch(msg.ChatID)
-			imageCmd := m.startInlineImageLoads(msg.ChatID)
 			var nextPageCmd tea.Cmd
 			switch {
 			case state.loadingAll && state.older != nil:
@@ -378,11 +398,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			default:
 				m.status = "Loaded older messages"
 			}
+			var imageCmd tea.Cmd
 			if msg.ChatID == m.selectedID {
 				m.syncViewport(false)
 				newLineCount := renderedLineCount(m.renderThread(msg.ChatID, state.messages).content)
 				m.viewport.SetYOffset(oldOffset + max(0, newLineCount-oldLineCount))
 				state.offset = m.viewport.YOffset
+				imageCmd = m.refreshInlineImages()
 			}
 			return m, tea.Batch(imageCmd, nextPageCmd, m.startPendingLatestMerge(msg.ChatID))
 		}
@@ -417,7 +439,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "Refreshed"
 		m.lastRefreshed = msg.LoadedAt
 		m.refreshConversationSearch(msg.ChatID)
-		imageCmd := m.startInlineImageLoads(msg.ChatID)
+		m.pruneInlineImages()
+		var imageCmd tea.Cmd
 		if msg.ChatID == m.selectedID {
 			m.syncViewport(false)
 			switch {
@@ -427,6 +450,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetYOffset(oldOffset)
 			}
 			state.offset = m.viewport.YOffset
+			imageCmd = m.refreshInlineImages()
 		}
 		return m, tea.Batch(imageCmd, m.startPendingLatestMerge(msg.ChatID))
 
@@ -448,21 +472,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		listCmd := m.chatList.SetChats(m.chats, m.selectedID)
 		m.syncViewport(false)
-		return m, listCmd
+		return m, tea.Batch(listCmd, m.refreshInlineImages())
 
 	case SendFinishedMsg:
 		return m.handleSendFinished(msg)
 
 	case inlineImageLoadedMsg:
-		state := m.inlineImages[msg.key]
-		if state == nil || state.generation != msg.generation {
+		if !m.applyInlineImageLoaded(msg) {
 			return m, nil
-		}
-		state.loading = false
-		state.rendered = msg.rendered
-		state.err = msg.err
-		if msg.err == nil && msg.rendered.Protocol == inlineimage.Kitty {
-			state.transferUntil = time.Now().Add(time.Second)
 		}
 		if msg.key.chatID == m.selectedID {
 			wasAtBottom := m.viewport.AtBottom()
@@ -478,7 +495,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				state.offset = m.viewport.YOffset
 			}
 		}
-		return m, nil
+		return m, m.refreshInlineImages()
 
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
@@ -506,11 +523,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.String() == "?" {
 			m.help.Toggle()
-			return m, nil
+			return m, m.refreshInlineImages()
 		}
 		if m.help.Visible() {
-			if msg.String() == "esc" || msg.String() == "?" {
+			if msg.String() == "esc" {
 				m.help.Hide()
+				return m, m.refreshInlineImages()
 			}
 			return m, nil
 		}
@@ -526,13 +544,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.focus == FocusViewport && m.conversationFilterActive(m.selectedID) && msg.String() == "esc" {
 			m.clearConversationSearch(true)
-			return m, nil
+			return m, m.refreshInlineImages()
 		}
 		if msg.String() == "i" {
 			return m, m.focusComposer()
 		}
 		if msg.String() == "r" {
 			return m.refresh()
+		}
+		if msg.String() == "R" {
+			return m, m.retryInlineImages()
 		}
 		if msg.String() == "tab" {
 			return m, m.toggleFocus()
@@ -581,6 +602,7 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			if m.layout == LayoutNarrow {
 				m.narrowPane = NarrowConversation
 				m.setSizes()
+				cmd = tea.Batch(cmd, m.refreshInlineImages())
 			}
 			return m, cmd
 		}
@@ -597,11 +619,11 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case tea.MouseButtonWheelUp:
 		m.viewport.ScrollUp(3)
 		m.saveViewportOffset()
-		return m, nil
+		return m, m.refreshInlineImages()
 	case tea.MouseButtonWheelDown:
 		m.viewport.ScrollDown(3)
 		m.saveViewportOffset()
-		return m, nil
+		return m, m.refreshInlineImages()
 	case tea.MouseButtonLeft:
 		if msg.Action != tea.MouseActionPress {
 			return m, nil
@@ -648,6 +670,7 @@ func (m *Model) refreshChat(chatID messages.ChatID, commands ...tea.Cmd) tea.Cmd
 
 func (m *Model) startHistoryLoad(chatID messages.ChatID) tea.Cmd {
 	delete(m.pendingLatestMerges, chatID)
+	m.cancelInlineImageLoads(chatID)
 	state := m.threads[chatID]
 	if state == nil {
 		state = &threadState{}
@@ -740,7 +763,7 @@ func (m Model) handleNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.narrowPane = NarrowList
 			m.focus = FocusList
 			m.setSizes()
-			return m, nil
+			return m, m.refreshInlineImages()
 		}
 	}
 
@@ -753,6 +776,7 @@ func (m Model) handleNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if m.layout == LayoutNarrow {
 					m.narrowPane = NarrowConversation
 					m.setSizes()
+					cmd = tea.Batch(cmd, m.refreshInlineImages())
 				}
 				return m, cmd
 			}
@@ -804,13 +828,14 @@ func (m Model) handleNavigationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		m.saveViewportOffset()
-		return m, cmd
+		return m, tea.Batch(cmd, m.refreshInlineImages())
 	}
 	m.saveViewportOffset()
+	imageCmd := m.refreshInlineImages()
 	if loadOlder && m.viewport.AtTop() {
-		return m, m.startOlderHistoryLoad()
+		return m, tea.Batch(imageCmd, m.startOlderHistoryLoad())
 	}
-	return m, nil
+	return m, imageCmd
 }
 
 func (m *Model) toggleFocus() tea.Cmd {
@@ -822,13 +847,13 @@ func (m *Model) toggleFocus() tea.Cmd {
 		case m.focus == FocusViewport:
 			cmd := m.focusComposer()
 			m.setSizes()
-			return cmd
+			return tea.Batch(cmd, m.refreshInlineImages())
 		default:
 			m.composer.Blur()
 			m.focus = FocusViewport
 		}
 		m.setSizes()
-		return nil
+		return m.refreshInlineImages()
 	}
 	switch m.focus {
 	case FocusList:
@@ -869,7 +894,7 @@ func (m *Model) selectChat(chatID messages.ChatID) tea.Cmd {
 		m.chatList.SelectID(chatID)
 		if state := m.threads[chatID]; state != nil && (state.loaded || state.loading) {
 			m.syncViewport(false)
-			return nil
+			return m.refreshInlineImages()
 		}
 		return m.startHistoryLoad(chatID)
 	}
@@ -884,7 +909,8 @@ func (m *Model) selectChat(chatID messages.ChatID) tea.Cmd {
 	m.loadSelectedDraft()
 	m.composer.Blur()
 	m.syncViewport(true)
-	return m.startHistoryLoad(chatID)
+	historyCmd := m.startHistoryLoad(chatID)
+	return tea.Batch(historyCmd, m.refreshInlineImages())
 }
 
 func (m *Model) saveViewportOffset() {
@@ -896,12 +922,17 @@ func (m *Model) saveViewportOffset() {
 func (m *Model) syncViewport(switched bool) {
 	state := m.threads[m.selectedID]
 	if state == nil || !state.loaded {
+		if state != nil {
+			state.placements = nil
+			state.imageRefs = nil
+		}
 		m.viewport.SetContent("")
 		m.viewport.GotoTop()
 		return
 	}
 	rendered := m.renderThread(m.selectedID, state.messages)
 	state.placements = rendered.placements
+	state.imageRefs = rendered.imageRefs
 	m.viewport.SetContent(rendered.content)
 	if switched {
 		m.viewport.SetYOffset(state.offset)

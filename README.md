@@ -123,6 +123,7 @@ Options:
 | `/` | Filter loaded messages and attachment names |
 | `i` | Compose a message |
 | `r` | Refresh |
+| `R` | Retry visible images |
 | `Esc` / `←` | Return to conversation list |
 
 ### Composer
@@ -156,12 +157,13 @@ See [Messages safety design](docs/design/messages-safety.md) for the complete da
 
 Aspen automatically reserves image space inside the message outline:
 
-- Ghostty uses the Kitty graphics protocol.
+- Ghostty uses Kitty Unicode placeholders so images follow normal TUI redraws and scrolling.
 - iTerm2 uses OSC 1337.
 - HEIC and HEIF attachments are converted locally with `/usr/bin/sips`.
 - Temporary conversion files use owner-only `0600` permissions.
-- Source size, pixel count, and transfer dimensions are bounded.
-- Kitty images crop to the visible portion while scrolling.
+- Source size, pixel count, transfer dimensions, and Aspen's encoded-image cache are bounded.
+- Aspen processes visible and near-visible images and evicts least-recently-visible cached payloads.
+- Kitty terminal data is freed after an image leaves the viewport. Press `R` to retry visible images.
 
 OSC 1337 has no source-cropping operation, so iTerm2 only places an image while the full image area is visible.
 

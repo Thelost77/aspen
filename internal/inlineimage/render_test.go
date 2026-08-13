@@ -1,7 +1,9 @@
 package inlineimage
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"image"
 	"image/color"
@@ -10,6 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
+	ansikitty "github.com/charmbracelet/x/ansi/kitty"
 )
 
 func TestDetectSupportedTerminals(t *testing.T) {
@@ -87,17 +92,133 @@ func TestRenderProducesNativeKittyImage(t *testing.T) {
 	if rendered.Columns > 30 || rendered.Rows > 12 || rendered.Columns <= 0 || rendered.Rows <= 0 {
 		t.Fatalf("native size = %dx%d", rendered.Columns, rendered.Rows)
 	}
-	if transfer := rendered.TransferSequence(); !strings.Contains(transfer, "\x1b_Ga=t,f=100") || strings.Contains(transfer, "▀") {
-		t.Fatalf("invalid Kitty transfer: %q", transfer)
-	}
-	if display := rendered.DisplaySequence(7); !strings.Contains(display, "a=p,i=42,p=7") || !strings.Contains(display, "C=1") {
-		t.Fatalf("invalid Kitty placement: %q", display)
-	}
-	if rendered.Rows > 1 {
-		partial := rendered.DisplayRegionSequence(7, 1, rendered.Rows-1)
-		if !strings.Contains(partial, "a=p,i=42,p=7") || !strings.Contains(partial, fmt.Sprintf("r=%d", rendered.Rows-1)) || !strings.Contains(partial, "y=") {
-			t.Fatalf("invalid cropped Kitty placement: %q", partial)
+	transfer := rendered.TransferSequence()
+	control := strings.SplitN(strings.TrimPrefix(transfer, "\x1b_G"), ";", 2)[0]
+	for _, required := range []string{"a=T", "f=100", "i=42", "p=1", "U=1", "C=1", "N=1"} {
+		if !strings.Contains(control, required) {
+			t.Fatalf("Kitty transfer lacks %s: %q", required, transfer)
 		}
+	}
+	if strings.Contains(control, "s=") || strings.Contains(control, "v=") || strings.Contains(transfer, "▀") {
+		t.Fatalf("invalid Kitty PNG transfer: %q", transfer)
+	}
+	row := rendered.PlaceholderRow(0)
+	if width := ansi.StringWidth(row); width != rendered.Columns {
+		t.Fatalf("placeholder width = %d, want %d: %q", width, rendered.Columns, row)
+	}
+	if count := strings.Count(row, string(ansikitty.Placeholder)); count != rendered.Columns {
+		t.Fatalf("placeholder count = %d, want %d", count, rendered.Columns)
+	}
+	placementControl := fmt.Sprintf("p=%d", kittyPlacementID)
+	underlineControl := fmt.Sprintf("\x1b[58;5;%dm", kittyPlacementID)
+	if !strings.Contains(control, placementControl) || !strings.Contains(row, underlineControl) {
+		t.Fatalf("Kitty placement ID differs between transfer and placeholder: control=%q row=%q", control, row)
+	}
+	if display := rendered.ITerm2DisplaySequence(); display != "" {
+		t.Fatalf("Kitty unexpectedly used a cursor placement: %q", display)
+	}
+	if cleanup := rendered.DeleteImageSequence(); !strings.Contains(cleanup, "a=d,d=I,i=42") {
+		t.Fatalf("Kitty cleanup does not free image data: %q", cleanup)
+	}
+}
+
+func TestKittyTransferChunksRoundTrip(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x00, 0x7f, 0xff}, 5000)
+	sequence := kittyTransfer(42, 20, 10, payload)
+	var encoded strings.Builder
+	chunks := strings.Split(sequence, "\x1b_G")
+	for _, chunk := range chunks[1:] {
+		chunk = strings.TrimSuffix(chunk, "\x1b\\")
+		parts := strings.SplitN(chunk, ";", 2)
+		if len(parts) != 2 {
+			t.Fatalf("invalid Kitty chunk: %q", chunk)
+		}
+		if len(parts[1]) > kittyChunkSize {
+			t.Fatalf("encoded chunk size = %d, want <= %d", len(parts[1]), kittyChunkSize)
+		}
+		encoded.WriteString(parts[1])
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(decoded, payload) {
+		t.Fatal("chunked Kitty payload did not round trip")
+	}
+}
+
+func TestKittyPlaceholderCarriesFullImageID(t *testing.T) {
+	rendered := Rendered{Protocol: Kitty, ID: 0x0200002a, Columns: 1, Rows: 1}
+	row := rendered.PlaceholderRow(0)
+	if !strings.Contains(row, string(ansikitty.Diacritic(2))) {
+		t.Fatalf("placeholder omitted high image ID byte: %q", row)
+	}
+}
+
+func TestTmuxWrapsFullMultiChunkKittyTransferButNotPlaceholderText(t *testing.T) {
+	t.Setenv("TMUX", "/tmp/tmux-test/default,1,0")
+	payload := bytes.Repeat([]byte("multi-chunk-fixture"), 1000)
+	raw := kittyTransfer(42, 2, 1, payload)
+	want := "\x1bPtmux;" + strings.ReplaceAll(raw, "\x1b", "\x1b\x1b") + "\x1b\\"
+	rendered := Rendered{
+		Protocol: Kitty,
+		ID:       42,
+		Columns:  2,
+		Rows:     1,
+		transfer: wrapTmux(raw),
+	}
+	transfer := rendered.TransferSequence()
+	if transfer != want || strings.Count(transfer, "\x1b\x1b_G") < 2 {
+		t.Fatalf("multi-chunk Kitty transfer was not fully wrapped for tmux: %q", transfer)
+	}
+	if row := rendered.PlaceholderRow(0); strings.Contains(row, "tmux;") {
+		t.Fatalf("placeholder text was incorrectly wrapped for tmux: %q", row)
+	}
+}
+
+func TestRenderErrorKindsAreTypedAtSource(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want ErrorKind
+	}{
+		{name: "conversion", err: newRenderError(ErrorConversion, "conversion failed"), want: ErrorConversion},
+		{name: "decode", err: newRenderError(ErrorDecode, "decode failed"), want: ErrorDecode},
+		{name: "timeout", err: context.DeadlineExceeded, want: ErrorTimeout},
+		{name: "source limit", err: newRenderError(ErrorSourceLimit, "too large"), want: ErrorSourceLimit},
+		{name: "dimension limit", err: newRenderError(ErrorDimensionLimit, "too many pixels"), want: ErrorDimensionLimit},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ErrorKindOf(test.err); got != test.want {
+				t.Fatalf("ErrorKindOf() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRenderClassifiesDecodeAndLimitFailures(t *testing.T) {
+	invalidPath := filepath.Join(t.TempDir(), "invalid.png")
+	if err := os.WriteFile(invalidPath, []byte("not an image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(context.Background(), invalidPath, Kitty, 1, 20, 10); ErrorKindOf(err) != ErrorDecode {
+		t.Fatalf("invalid image kind = %q, want %q", ErrorKindOf(err), ErrorDecode)
+	}
+
+	largePath := filepath.Join(t.TempDir(), "large.png")
+	file, err := os.Create(largePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSourceSize + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Render(context.Background(), largePath, Kitty, 1, 20, 10); ErrorKindOf(err) != ErrorSourceLimit {
+		t.Fatalf("large image kind = %q, want %q", ErrorKindOf(err), ErrorSourceLimit)
 	}
 }
 
@@ -110,11 +231,11 @@ func TestRenderProducesNativeITerm2Image(t *testing.T) {
 	if rendered.TransferSequence() != "" {
 		t.Fatal("iTerm2 unexpectedly produced a separate transfer")
 	}
-	display := rendered.DisplaySequence(7)
+	display := rendered.ITerm2DisplaySequence()
 	if !strings.Contains(display, "\x1b]1337;File=inline=1") || !strings.Contains(display, "preserveAspectRatio=1") || strings.Contains(display, "▀") {
 		t.Fatalf("invalid iTerm2 display: %q", display)
 	}
-	if rendered.Rows > 1 && rendered.DisplayRegionSequence(7, 1, rendered.Rows-1) != "" {
+	if rendered.Rows > 1 && rendered.ITerm2DisplayRegionSequence(1, rendered.Rows-1) != "" {
 		t.Fatal("iTerm2 partial placement would stretch instead of crop")
 	}
 }
