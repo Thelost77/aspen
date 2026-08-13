@@ -169,8 +169,7 @@ func (m Model) handleSendFinished(msg SendFinishedMsg) (tea.Model, tea.Cmd) {
 	if m.store == nil {
 		return m, nil
 	}
-	m.chatGeneration++
-	return m, tea.Batch(loadChatsCmd(m.store, m.chatGeneration), m.startHistoryLoad(msg.ChatID))
+	return m, m.refreshChat(msg.ChatID)
 }
 
 func (m Model) targetForChat(chat messages.Chat) (msgsender.SendTarget, string, bool) {

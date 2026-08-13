@@ -80,5 +80,6 @@ type HistoryPage struct {
 type Store interface {
 	Conversations(context.Context, int) ([]Chat, error)
 	History(context.Context, ChatID, int, *HistoryCursor) (HistoryPage, error)
+	ChangeVersion(context.Context) (int64, error)
 	Close() error
 }
