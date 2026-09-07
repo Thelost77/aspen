@@ -141,7 +141,8 @@ func isVisibleAttributedText(data []byte) bool {
 	for len(data) > 0 {
 		r, size := utf8.DecodeRune(data)
 		data = data[size:]
-		if !unicode.IsPrint(r) && r != '\n' && r != '\t' {
+		// Unicode spaces and joiners are valid text even when unicode.IsPrint is false.
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
 			return false
 		}
 	}

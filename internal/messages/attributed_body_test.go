@@ -17,6 +17,29 @@ func TestExtractAttributedTextUsesTypedStreamLength(t *testing.T) {
 	}
 }
 
+func TestExtractAttributedTextPreservesUnicode(t *testing.T) {
+	t.Parallel()
+
+	for _, text := range []string{
+		"Dziś czytam książkę",
+		"Dziś\u00a0czytam książkę",
+		"To jest próba i już\u00a0nic nie dodajemy",
+		"Cena: 10\u202f000 zł",
+		"Programistka 👩\u200d💻",
+		"Pierwszy wiersz\r\ndrugi\twiersz",
+	} {
+		t.Run(text, func(t *testing.T) {
+			data := append([]byte("\x04\x0bstreamtyped\x81\xe8\x03\x84\x01@\x84\x84\x84\x12NSAttributedString\x00\x84\x84\x08NSObject\x00\x85\x92\x84\x84\x84\x08NSString\x01\x94\x84\x01+"), byte(len(text)))
+			data = append(data, []byte(text)...)
+			data = append(data, []byte("\x86\x84\x02iI\x01\x24\x92\x84\x84\x84\x0cNSDictionary")...)
+
+			if got := ExtractAttributedText(data); got != text {
+				t.Fatalf("ExtractAttributedText() = %q, want %q", got, text)
+			}
+		})
+	}
+}
+
 func TestExtractAttributedTextUsesExtendedTypedStreamLength(t *testing.T) {
 	payload := bytes.Repeat([]byte("a"), 300)
 	data := append([]byte("streamtyped NSString\x01+\x81\x2c\x01"), payload...)

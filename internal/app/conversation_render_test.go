@@ -31,6 +31,28 @@ func TestRenderMessagesSeparatesAdjacentBubbles(t *testing.T) {
 	}
 }
 
+func TestRenderMessagePreservesUnicodeSpacing(t *testing.T) {
+	t.Parallel()
+
+	for _, text := range []string{
+		"Dziś czytam książkę",
+		"Dziś\u00a0czytam książkę",
+		"Cena: 10\u202f000 zł",
+		"Programistka 👩\u200d💻",
+	} {
+		t.Run(text, func(t *testing.T) {
+			message := messages.Message{ID: 1, ChatID: 1, Text: text}
+			for _, outgoing := range []bool{false, true} {
+				message.IsFromMe = outgoing
+				block := renderMessageInline(message, messages.Chat{ID: 1}, 60, false, ui.DefaultStyles(), nil)
+				if rendered := ansi.Strip(block.content); !strings.Contains(rendered, text) {
+					t.Fatalf("outgoing=%t: message text %q changed during rendering:\n%s", outgoing, text, rendered)
+				}
+			}
+		})
+	}
+}
+
 func TestInlineImageIsInsideSingleMessageOutline(t *testing.T) {
 	attachment := messages.Attachment{ID: 7, Name: "IMG.heic", IsImage: true}
 	message := messages.Message{ID: 1, ChatID: 1, Attachments: []messages.Attachment{attachment}}
