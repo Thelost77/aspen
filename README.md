@@ -159,11 +159,14 @@ Aspen automatically reserves image space inside the message outline:
 
 - Ghostty uses Kitty Unicode placeholders so images follow normal TUI redraws and scrolling.
 - iTerm2 uses OSC 1337.
-- HEIC and HEIF attachments are converted locally with `/usr/bin/sips`.
+- HEIC and HEIF attachments are converted locally with `/usr/bin/sips` (by extension or file brand).
 - Temporary conversion files use owner-only `0600` permissions.
 - Source size, pixel count, transfer dimensions, and Aspen's encoded-image cache are bounded.
+- Kitty transfers use zlib compression to keep SSH payloads smaller.
 - Aspen processes visible and near-visible images and evicts least-recently-visible cached payloads.
 - Kitty terminal data is freed after an image leaves the viewport. Press `R` to retry visible images.
+
+Inline images need a direct terminal graphics channel. Use SSH (or a local terminal), not mosh: mosh does not forward Kitty/iTerm2 graphics sequences. Under mosh Aspen shows `Image not available via mosh` instead of empty placeholders.
 
 OSC 1337 has no source-cropping operation, so iTerm2 only places an image while the full image area is visible.
 

@@ -94,10 +94,13 @@ func TestRenderProducesNativeKittyImage(t *testing.T) {
 	}
 	transfer := rendered.TransferSequence()
 	control := strings.SplitN(strings.TrimPrefix(transfer, "\x1b_G"), ";", 2)[0]
-	for _, required := range []string{"a=T", "f=100", "i=42", "p=1", "U=1", "C=1", "N=1"} {
+	for _, required := range []string{"a=T", "f=100", "o=z", "i=42", "p=1", "U=1", "C=1"} {
 		if !strings.Contains(control, required) {
 			t.Fatalf("Kitty transfer lacks %s: %q", required, transfer)
 		}
+	}
+	if strings.Contains(control, "N=1") {
+		t.Fatalf("Kitty transfer should not mark images transient: %q", transfer)
 	}
 	if strings.Contains(control, "s=") || strings.Contains(control, "v=") || strings.Contains(transfer, "▀") {
 		t.Fatalf("invalid Kitty PNG transfer: %q", transfer)
@@ -117,7 +120,7 @@ func TestRenderProducesNativeKittyImage(t *testing.T) {
 	if display := rendered.ITerm2DisplaySequence(); display != "" {
 		t.Fatalf("Kitty unexpectedly used a cursor placement: %q", display)
 	}
-	if cleanup := rendered.DeleteImageSequence(); !strings.Contains(cleanup, "a=d,d=I,i=42") {
+	if cleanup := rendered.DeleteImageSequence(); !strings.Contains(cleanup, "a=d,d=i,i=42") {
 		t.Fatalf("Kitty cleanup does not free image data: %q", cleanup)
 	}
 }
@@ -271,4 +274,26 @@ func writeFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestDetectMosh(t *testing.T) {
+	if !DetectMosh(func(key string) string {
+		if key == "MOSH_SESSION" {
+			return "1"
+		}
+		return ""
+	}) {
+		t.Fatal("MOSH_SESSION should detect mosh")
+	}
+	if DetectMosh(func(string) string { return "" }) {
+		t.Fatal("empty env should not detect mosh")
+	}
+}
+
+func TestSelectProtocolForcesOffUnderMosh(t *testing.T) {
+	t.Setenv("MOSH_SESSION", "session")
+	protocol, err := SelectProtocol("kitty", func() Protocol { return Kitty })
+	if err != nil || protocol != Unsupported {
+		t.Fatalf("SelectProtocol(kitty) under mosh = %v, %v", protocol, err)
+	}
 }

@@ -11,15 +11,24 @@ import (
 )
 
 const conversationsQuery = `
-WITH visible AS (
+WITH ranked_chats AS (
+	SELECT
+		cmj.chat_id,
+		MAX(COALESCE(m.date, 0)) AS last_message_date,
+		SUM(CASE WHEN COALESCE(m.is_from_me, 0) = 0 AND COALESCE(m.is_read, 0) = 0 THEN 1 ELSE 0 END) AS unread_count
+	FROM chat_message_join cmj
+	JOIN message m ON m.ROWID = cmj.message_id
+	WHERE COALESCE(m.associated_message_type, 0) = 0
+	GROUP BY cmj.chat_id
+	ORDER BY last_message_date DESC, chat_id DESC
+	LIMIT ?
+), latest AS (
 	SELECT
 		cmj.chat_id,
 		m.ROWID AS message_id,
 		m.text,
 		m.attributedBody,
 		COALESCE(m.date, 0) AS date,
-		COALESCE(m.is_from_me, 0) AS is_from_me,
-		COALESCE(m.is_read, 0) AS is_read,
 		COALESCE(m.item_type, 0) AS item_type,
 		COALESCE(m.is_system_message, 0) AS is_system_message,
 		COALESCE(m.is_service_message, 0) AS is_service_message,
@@ -28,16 +37,10 @@ WITH visible AS (
 			PARTITION BY cmj.chat_id
 			ORDER BY COALESCE(m.date, 0) DESC, m.ROWID DESC
 		) AS row_number
-	FROM chat_message_join cmj
+	FROM ranked_chats rc
+	JOIN chat_message_join cmj ON cmj.chat_id = rc.chat_id
 	JOIN message m ON m.ROWID = cmj.message_id
 	WHERE COALESCE(m.associated_message_type, 0) = 0
-), aggregate_messages AS (
-	SELECT
-		chat_id,
-		MAX(date) AS last_message_date,
-		SUM(CASE WHEN is_from_me = 0 AND is_read = 0 THEN 1 ELSE 0 END) AS unread_count
-	FROM visible
-	GROUP BY chat_id
 )
 SELECT
 	c.ROWID,
@@ -46,19 +49,18 @@ SELECT
 	COALESCE(c.display_name, ''),
 	COALESCE(c.service_name, ''),
 	COALESCE(c.style, 0),
-	a.last_message_date,
-	COALESCE(a.unread_count, 0),
+	rc.last_message_date,
+	COALESCE(rc.unread_count, 0),
 	COALESCE(v.text, ''),
 	v.attributedBody,
 	v.item_type,
 	v.is_system_message,
 	v.is_service_message,
 	v.has_attachments
-FROM chat c
-JOIN aggregate_messages a ON a.chat_id = c.ROWID
-JOIN visible v ON v.chat_id = c.ROWID AND v.row_number = 1
-ORDER BY a.last_message_date DESC, c.ROWID DESC
-LIMIT ?`
+FROM ranked_chats rc
+JOIN chat c ON c.ROWID = rc.chat_id
+JOIN latest v ON v.chat_id = rc.chat_id AND v.row_number = 1
+ORDER BY rc.last_message_date DESC, c.ROWID DESC`
 
 func (s *SQLiteStore) ChangeVersion(ctx context.Context) (int64, error) {
 	s.changeConnLock.Lock()
@@ -343,7 +345,7 @@ ORDER BY maj.message_id, a.ROWID`
 		if attachment.Name == "" || attachment.Name == "." {
 			attachment.Name = "Attachment"
 		}
-		attachment.IsImage = strings.HasPrefix(strings.ToLower(attachment.MIMEType), "image/") || imageUTIs[strings.ToLower(attachment.UTI)]
+		attachment.IsImage = attachmentIsImage(attachment.MIMEType, attachment.UTI, attachment.Path)
 		messages[index].Attachments = append(messages[index].Attachments, attachment)
 	}
 	if err := rows.Err(); err != nil {
@@ -378,18 +380,36 @@ func expandAttachmentPath(path string) string {
 	return path
 }
 
-var imageUTIs = map[string]bool{
-	"public.image":       true,
+// supportedImageUTIs are formats Aspen can decode or convert for inline display.
+// TIFF/BMP/SVG are excluded: Go's image decoders do not handle them and we do
+// not promise conversion for those containers.
+var supportedImageUTIs = map[string]bool{
 	"public.jpeg":        true,
 	"public.png":         true,
 	"public.heic":        true,
 	"public.heif":        true,
 	"public.gif":         true,
-	"public.tiff":        true,
-	"public.bmp":         true,
 	"public.webp":        true,
-	"public.svg-image":   true,
 	"com.compuserve.gif": true,
+}
+
+func attachmentIsImage(mimeType, uti, path string) bool {
+	mime := strings.ToLower(strings.TrimSpace(mimeType))
+	switch {
+	case mime == "image/tiff", mime == "image/bmp", mime == "image/svg+xml":
+		return false
+	case strings.HasPrefix(mime, "image/"):
+		return true
+	}
+	if supportedImageUTIs[strings.ToLower(strings.TrimSpace(uti))] {
+		return true
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif":
+		return true
+	default:
+		return false
+	}
 }
 
 var _ Store = (*SQLiteStore)(nil)

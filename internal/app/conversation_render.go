@@ -23,7 +23,7 @@ type renderedBlock struct {
 }
 
 func renderMessages(all []messages.Message, chat messages.Chat, width int, styles ui.Styles) string {
-	return renderMessagesInline(all, chat, width, styles, nil).content
+	return renderMessagesInline(all, chat, width, styles, nil, "").content
 }
 
 func renderMessagesInline(
@@ -32,6 +32,7 @@ func renderMessagesInline(
 	width int,
 	styles ui.Styles,
 	imageLookup func(messages.ChatID, messages.Attachment) *inlineImageState,
+	imageBlockedLabel string,
 ) renderedConversation {
 	if width <= 0 || len(all) == 0 {
 		return renderedConversation{}
@@ -46,7 +47,7 @@ func renderMessagesInline(
 			blocks = append(blocks, renderedBlock{content: styles.Muted.Render(separator)})
 		}
 		grouped := i > 0 && previous.IsFromMe == message.IsFromMe && previous.Sender == message.Sender && ui.SameLocalDay(previous.SentAt, message.SentAt) && message.SentAt.Sub(previous.SentAt) <= 5*time.Minute
-		blocks = append(blocks, renderMessageInline(message, chat, width, grouped, styles, imageLookup))
+		blocks = append(blocks, renderMessageInline(message, chat, width, grouped, styles, imageLookup, imageBlockedLabel))
 		previous = message
 	}
 
@@ -80,6 +81,7 @@ func renderMessageInline(
 	grouped bool,
 	styles ui.Styles,
 	imageLookup func(messages.ChatID, messages.Attachment) *inlineImageState,
+	imageBlockedLabel string,
 ) renderedBlock {
 	bubbleOuterWidth := min(72, max(12, width*3/4))
 	bubbleOuterWidth = min(bubbleOuterWidth, max(1, width-2))
@@ -105,6 +107,10 @@ func renderMessageInline(
 	for _, attachment := range message.Attachments {
 		if !attachment.IsImage || imageLookup == nil {
 			contentLines = append(contentLines, strings.Split(ui.Wrap("📎 "+attachmentLabel(attachment), contentWidth), "\n")...)
+			continue
+		}
+		if imageBlockedLabel != "" {
+			contentLines = append(contentLines, strings.Split(ui.Wrap(imageBlockedLabel, contentWidth), "\n")...)
 			continue
 		}
 

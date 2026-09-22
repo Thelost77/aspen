@@ -55,6 +55,10 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	if inlineimage.DetectMosh(os.Getenv) {
+		protocol = inlineimage.Unsupported
+		selectionSource = "mosh"
+	}
 	cleanupLogger, err := logger.Init(*debugLogging)
 	if err != nil {
 		return err
@@ -70,6 +74,9 @@ func run(args []string) error {
 		return resolver, errors.Join(diagnostics...)
 	})
 	model.SetInlineImageProtocol(protocol)
+	if selectionSource == "mosh" {
+		model.SetGraphicsUnavailableReason("mosh")
+	}
 	terminalOutput := inlineimage.NewTerminalOutput(os.Stdout)
 	model.SetInlineImageOutput(terminalOutput)
 	logger.Info("inline image protocol selected", "protocol", protocol.String(), "source", selectionSource)

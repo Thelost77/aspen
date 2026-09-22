@@ -86,10 +86,10 @@ func TestKittyFreesImagesOnlyOnResidentToFreedTransition(t *testing.T) {
 	if err := output.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(captured.String(), "a=d,d=I,i=43") {
+	if !strings.Contains(captured.String(), "a=d,d=i,i=43") {
 		t.Fatalf("hidden resident image was not freed: %q", captured.String())
 	}
-	if strings.Contains(captured.String(), "a=d,d=I,i=42") {
+	if strings.Contains(captured.String(), "a=d,d=i,i=42") {
 		t.Fatalf("visible resident image was freed: %q", captured.String())
 	}
 	captured.Reset()
@@ -97,7 +97,7 @@ func TestKittyFreesImagesOnlyOnResidentToFreedTransition(t *testing.T) {
 	if err := output.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(captured.String(), "a=d,d=I") {
+	if strings.Contains(captured.String(), "a=d,d=i") {
 		t.Fatalf("freed image was deleted twice: %q", captured.String())
 	}
 }
@@ -159,7 +159,7 @@ func TestHelpHidesAndRestoresKittyImages(t *testing.T) {
 		if err := output.Flush(); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(captured.String(), "a=d,d=I") {
+		if !strings.Contains(captured.String(), "a=d,d=i") {
 			t.Fatal("help did not free the resident Kitty image")
 		}
 		captured.Reset()
@@ -263,12 +263,12 @@ func TestMultipleImagesLoadThroughBubbleTeaBatchRuntime(t *testing.T) {
 	}
 
 	program.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
-	waitForTerminalCount(t, &captured, "a=d,d=I", 3)
+	waitForTerminalCount(t, &captured, "a=d,d=i", 3)
 	program.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 	waitForTerminalCount(t, &captured, "\x1b_Ga=T", 6)
 
 	program.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
-	waitForTerminalCount(t, &captured, "a=d,d=I", 6)
+	waitForTerminalCount(t, &captured, "a=d,d=i", 6)
 	program.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
 	waitForTerminalCount(t, &captured, "\x1b_Ga=T", 9)
 

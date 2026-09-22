@@ -44,12 +44,28 @@ func TestRenderMessagePreservesUnicodeSpacing(t *testing.T) {
 			message := messages.Message{ID: 1, ChatID: 1, Text: text}
 			for _, outgoing := range []bool{false, true} {
 				message.IsFromMe = outgoing
-				block := renderMessageInline(message, messages.Chat{ID: 1}, 60, false, ui.DefaultStyles(), nil)
+				block := renderMessageInline(message, messages.Chat{ID: 1}, 60, false, ui.DefaultStyles(), nil, "")
 				if rendered := ansi.Strip(block.content); !strings.Contains(rendered, text) {
 					t.Fatalf("outgoing=%t: message text %q changed during rendering:\n%s", outgoing, text, rendered)
 				}
 			}
 		})
+	}
+}
+
+func TestMoshBlocksInlineImagesWithExplicitLabel(t *testing.T) {
+	attachment := messages.Attachment{ID: 7, Name: "IMG.heic", IsImage: true}
+	message := messages.Message{ID: 1, ChatID: 1, Attachments: []messages.Attachment{attachment}}
+	block := renderMessageInline(message, messages.Chat{ID: 1}, 40, false, ui.DefaultStyles(), func(messages.ChatID, messages.Attachment) *inlineImageState {
+		t.Fatal("image lookup should not run under mosh")
+		return nil
+	}, "Image not available via mosh")
+	plain := ansi.Strip(block.content)
+	if !strings.Contains(plain, "Image not available via") || !strings.Contains(plain, "mosh") {
+		t.Fatalf("missing mosh label:\n%s", plain)
+	}
+	if strings.Contains(plain, "􎻮") || len(block.placements) != 0 {
+		t.Fatalf("mosh path still reserved inline image space:\n%s", plain)
 	}
 }
 
@@ -59,7 +75,7 @@ func TestInlineImageIsInsideSingleMessageOutline(t *testing.T) {
 	imageState := &inlineImageState{rendered: inlineimage.Rendered{Protocol: inlineimage.Kitty, ID: 42, Columns: 10, Rows: 3}}
 	block := renderMessageInline(message, messages.Chat{ID: 1}, 40, false, ui.DefaultStyles(), func(messages.ChatID, messages.Attachment) *inlineImageState {
 		return imageState
-	})
+	}, "")
 	plain := strings.Split(ansi.Strip(block.content), "\n")
 	if len(block.placements) != 1 {
 		t.Fatalf("placements = %d, want 1", len(block.placements))

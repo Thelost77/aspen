@@ -96,6 +96,7 @@ type Model struct {
 	inlineImageLoader           *inlineImageLoader
 	inlineImageOutput           inlineimage.TerminalOutput
 	imageProtocol               inlineimage.Protocol
+	graphicsUnavailableReason   string
 	inlineImageBytes            int
 	inlineImageCacheBudget      int
 	inlineImageGeneration       uint64
@@ -191,6 +192,10 @@ func (m *Model) SetInlineImageProtocol(protocol inlineimage.Protocol) {
 	m.imageProtocol = protocol
 }
 
+func (m *Model) SetGraphicsUnavailableReason(reason string) {
+	m.graphicsUnavailableReason = reason
+}
+
 func (m Model) Init() tea.Cmd {
 	var commands []tea.Cmd
 	if m.store != nil {
@@ -234,9 +239,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		newColumns, newRows := m.inlineImageDimensions()
 		if oldColumns != newColumns || oldRows != newRows {
 			m.invalidateInlineImageLayout()
-		} else {
-			m.resetInlineImageResidency()
 		}
+		// Spurious SSH/window size events used to free and re-upload every
+		// resident Kitty image. Only refresh visibility/transfer; keep cached
+		// payloads so placeholders do not outlive terminal image data.
 		m.syncViewport(false)
 		return m, m.refreshInlineImages()
 
@@ -939,10 +945,17 @@ func (m *Model) syncViewport(switched bool) {
 	}
 }
 
+func (m Model) imageBlockedLabel() string {
+	if m.graphicsUnavailableReason == "mosh" {
+		return "Image not available via mosh"
+	}
+	return ""
+}
+
 func (m Model) renderThread(chatID messages.ChatID, threadMessages []messages.Message) renderedConversation {
 	width := max(1, m.conversationContentWidth)
 	filtered := m.filteredConversationMessages(chatID, threadMessages)
-	return renderMessagesInline(filtered, m.chatByID[chatID], width, m.styles, m.inlineImageFor)
+	return renderMessagesInline(filtered, m.chatByID[chatID], width, m.styles, m.inlineImageFor, m.imageBlockedLabel())
 }
 
 func (m *Model) setSizes() {

@@ -2,6 +2,7 @@ package inlineimage
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -31,8 +32,8 @@ const (
 const (
 	maxSourceSize    = 50 * 1024 * 1024
 	maxPixels        = 40_000_000
-	maxPixelWidth    = 1600
-	maxPixelHeight   = 1200
+	maxPixelWidth    = 1200
+	maxPixelHeight   = 900
 	kittyChunkSize   = 4096
 	kittyPlacementID = 1
 )
@@ -174,6 +175,10 @@ func Render(ctx context.Context, path string, protocol Protocol, id uint32, maxC
 		return Rendered{}, err
 	}
 	payload := encoded.Bytes()
+	compressed, err := zlibCompress(payload)
+	if err != nil {
+		return Rendered{}, newRenderError(ErrorEncode, "compress inline PNG", err)
+	}
 	result := Rendered{
 		Protocol: protocol,
 		ID:       id,
@@ -182,8 +187,9 @@ func Render(ctx context.Context, path string, protocol Protocol, id uint32, maxC
 	}
 	switch protocol {
 	case Kitty:
-		result.transfer = wrapTmux(kittyTransfer(id, columns, rows, payload))
+		result.transfer = wrapTmux(kittyTransfer(id, columns, rows, compressed))
 	case ITerm2:
+		// iTerm2 inline images expect raw file bytes, not zlib-wrapped PNG.
 		encodedPayload := base64.StdEncoding.EncodeToString(payload)
 		result.display = wrapTmux(fmt.Sprintf("\x1b]1337;File=inline=1;width=%d;height=%d;preserveAspectRatio=1;size=%d:%s\x07", columns, rows, len(payload), encodedPayload))
 	}
@@ -235,7 +241,7 @@ func (r Rendered) DeleteImageSequence() string {
 	if r.Protocol != Kitty {
 		return ""
 	}
-	return wrapTmux(fmt.Sprintf("\x1b_Ga=d,d=I,i=%d,q=2\x1b\\", r.ID))
+	return wrapTmux(fmt.Sprintf("\x1b_Ga=d,d=i,i=%d,q=2\x1b\\", r.ID))
 }
 
 func kittyTransfer(id uint32, columns, rows int, payload []byte) string {
@@ -253,7 +259,7 @@ func kittyTransfer(id uint32, columns, rows int, payload []byte) string {
 		if first {
 			_, _ = fmt.Fprintf(
 				&output,
-				"\x1b_Ga=T,f=100,t=d,i=%d,p=%d,c=%d,r=%d,U=1,C=1,N=1,q=2,m=%d;%s\x1b\\",
+				"\x1b_Ga=T,f=100,t=d,o=z,i=%d,p=%d,c=%d,r=%d,U=1,C=1,q=2,m=%d;%s\x1b\\",
 				id, kittyPlacementID, columns, rows, more, chunk,
 			)
 			first = false
@@ -301,8 +307,7 @@ func prepareImage(ctx context.Context, path string) (string, func(), error) {
 	if info.Size() > maxSourceSize {
 		return "", nil, newRenderError(ErrorSourceLimit, "image attachment exceeds the 50 MB inline limit")
 	}
-	extension := strings.ToLower(filepath.Ext(path))
-	if extension != ".heic" && extension != ".heif" {
+	if !isHEICAttachment(path) {
 		return path, nil, nil
 	}
 	temporary, err := os.CreateTemp("", "aspen-inline-*.png")
@@ -329,6 +334,45 @@ func prepareImage(ctx context.Context, path string) (string, func(), error) {
 		return "", nil, newRenderError(ErrorConversion, "convert HEIC image with sips", err)
 	}
 	return temporaryPath, cleanup, nil
+}
+
+func zlibCompress(payload []byte) ([]byte, error) {
+	var compressed bytes.Buffer
+	writer := zlib.NewWriter(&compressed)
+	if _, err := writer.Write(payload); err != nil {
+		_ = writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	return compressed.Bytes(), nil
+}
+
+func isHEICAttachment(path string) bool {
+	extension := strings.ToLower(filepath.Ext(path))
+	if extension == ".heic" || extension == ".heif" {
+		return true
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = file.Close() }()
+	header := make([]byte, 12)
+	if _, err := file.Read(header); err != nil {
+		return false
+	}
+	if string(header[4:8]) != "ftyp" {
+		return false
+	}
+	brand := strings.ToLower(string(header[8:12]))
+	switch brand {
+	case "heic", "heif", "heix", "hevc", "hevx", "mif1", "msf1":
+		return true
+	default:
+		return false
+	}
 }
 
 func wrapTmux(sequence string) string {

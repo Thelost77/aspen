@@ -13,13 +13,37 @@ import (
 
 const terminalProbeTimeout = 500 * time.Millisecond
 
+// DetectMosh reports whether the process is running inside a mosh session.
+// Mosh does not forward Kitty/iTerm2 graphics APC sequences, so inline images
+// cannot work there even when the local terminal is Ghostty or iTerm2.
+func DetectMosh(getenv func(string) string) bool {
+	if getenv == nil {
+		return false
+	}
+	if getenv("MOSH_SESSION") != "" {
+		return true
+	}
+	// Older/alternate session markers seen in the wild.
+	if getenv("MOSH") != "" {
+		return true
+	}
+	termProgram := strings.ToLower(getenv("TERM_PROGRAM"))
+	return strings.Contains(termProgram, "mosh")
+}
+
 func SelectProtocol(value string, detector func() Protocol) (Protocol, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "auto", "":
 		return detector(), nil
 	case "kitty", "ghostty":
+		if DetectMosh(os.Getenv) {
+			return Unsupported, nil
+		}
 		return Kitty, nil
 	case "iterm2", "iterm":
+		if DetectMosh(os.Getenv) {
+			return Unsupported, nil
+		}
 		return ITerm2, nil
 	case "off", "none":
 		return Unsupported, nil
@@ -40,6 +64,9 @@ func (p Protocol) String() string {
 }
 
 func DetectTerminalWithSource() (Protocol, string) {
+	if DetectMosh(os.Getenv) {
+		return Unsupported, "mosh"
+	}
 	if protocol := Detect(os.Getenv); protocol != Unsupported {
 		return protocol, "environment"
 	}
